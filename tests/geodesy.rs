@@ -23,34 +23,273 @@
 
 use approx::assert_abs_diff_eq;
 use irontrack::geodesy::geoid::geoid_undulation;
+use irontrack::geodesy::{utm_to_wgs84, utm_zone, wgs84_to_utm};
 use irontrack::photogrammetry::flightlines::{
     generate_flight_lines, BoundingBox, FlightPlanParams,
 };
-use irontrack::types::SensorParams;
+use irontrack::types::{GeoCoord, SensorParams};
 
 /// Karney inverse geodesic against the GeodTest reference dataset.
 /// Each row: (lat1, lon1, az1, lat2, lon2, az2, s12, a12, m12, M12, M21, S12)
 /// Assert s12 and az1 within 1e-9 of reference values.
 #[test]
-#[ignore = "stub: implement when karney inverse is complete"]
+#[ignore = "stub: implement when geodtest_1k.dat fixture is added to tests/fixtures/"]
 fn geodesic_inverse_geodtest_regression() {}
 
 /// Geodesic direct: given (lat1, lon1, az1, s12), recover (lat2, lon2).
 /// Assert against GeodTest expected lat2/lon2 to within 1e-9 degrees.
 #[test]
-#[ignore = "stub: implement when karney direct is complete"]
+#[ignore = "stub: implement when geodtest_1k.dat fixture is added to tests/fixtures/"]
 fn geodesic_direct_geodtest_regression() {}
 
-/// WGS84 → UTM → WGS84 must recover the original coordinate to 1e-9 degrees.
-/// Test representative points across all 60 zones and both hemispheres.
+/// WGS84 → UTM → WGS84 must recover the original coordinate to < 1 mm.
+///
+/// Covers all 60 zones via equatorial points at each zone's central meridian,
+/// plus representative mid-latitude and southern-hemisphere cases.
+/// Round-trip tolerance: 1e-9 degrees ≈ 0.1 mm on the ground.
+///
+/// Norway/Svalbard zone exceptions (32V, 31X–37X) are intentionally excluded:
+/// they apply only to topographic map sheets, not to standard survey CRS.
+/// TODO: add Norwegian/Svalbard tests once zone-exception handling is in scope.
 #[test]
-#[ignore = "stub: implement when utm projection is complete"]
-fn utm_round_trip_all_zones() {}
+fn utm_round_trip_all_zones() {
+    /*
+     * 1-mm tolerance expressed in degrees.
+     * 1 mm ≈ 9e-6° at the equator (where the degree is longest).
+     * Using 1e-9° (≈ 0.1 mm) to be well inside the Karney-Krüger accuracy
+     * budget for the 6th-order series over WGS84.
+     */
+    const TOL_DEG: f64 = 1e-9;
 
-/// Assert UTM easting is in the valid range [100 000, 900 000] for every zone.
+    /*
+     * Equatorial sweep: one point at each zone's central meridian.
+     * CM = zone × 6 − 183, so zone 1 CM = −177°, zone 60 CM = 177°.
+     * At the equator the projection is symmetric; easting must equal
+     * the false easting (500 000 m) to within FP rounding.
+     */
+    for zone in 1u8..=60 {
+        let cm_lon = (zone as f64) * 6.0 - 183.0;
+        let coord = GeoCoord::from_degrees(0.0, cm_lon, 0.0)
+            .unwrap_or_else(|e| panic!("zone {zone} CM coord invalid: {e}"));
+
+        let utm = wgs84_to_utm(coord)
+            .unwrap_or_else(|e| panic!("zone {zone} forward failed: {e}"));
+
+        let (lat_back, lon_back) = utm_to_wgs84(&utm)
+            .unwrap_or_else(|e| panic!("zone {zone} inverse failed: {e}"));
+
+        assert_abs_diff_eq!(lat_back, 0.0, epsilon = TOL_DEG);
+        assert_abs_diff_eq!(lon_back, cm_lon, epsilon = TOL_DEG);
+    }
+
+    /*
+     * Additional off-CM and multi-hemisphere round-trips.
+     */
+    let extra: &[(f64, f64, &str)] = &[
+        (51.5074, -0.1278, "London"),
+        (-33.8688, 151.2093, "Sydney"),
+        (40.7128, -74.0060, "New York"),
+        (-33.9249, 18.4241, "Cape Town"),
+        (83.0, 0.0, "Near-pole 83°N"),
+        (-80.0, 45.0, "Near-limit south 80°S"),
+        (0.0, 0.0, "Equator prime meridian"),
+        (0.0, 179.999, "Near dateline east"),
+        (0.0, -179.999, "Near dateline west"),
+    ];
+
+    for &(lat, lon, label) in extra {
+        let coord = GeoCoord::from_degrees(lat, lon, 0.0)
+            .unwrap_or_else(|e| panic!("{label}: coord invalid: {e}"));
+
+        let utm = wgs84_to_utm(coord)
+            .unwrap_or_else(|e| panic!("{label}: forward failed: {e}"));
+
+        let (lat_back, lon_back) = utm_to_wgs84(&utm)
+            .unwrap_or_else(|e| panic!("{label}: inverse failed: {e}"));
+
+        assert_abs_diff_eq!(lat_back, lat, epsilon = TOL_DEG,);
+        assert_abs_diff_eq!(lon_back, lon, epsilon = TOL_DEG,);
+    }
+}
+
+/// UTM easting must lie in [100 000, 900 000] m for every valid input.
+///
+/// The 100 000 / 900 000 m bounds follow from the 500 000 m false easting
+/// and the maximum ±3° zone half-width: at the equator the strip is
+/// ≈ 333 km wide, giving easting ∈ [166 000, 834 000]. Near ±84° latitude
+/// the strip is narrower. Points on zone boundaries land near ±334 000 m
+/// offset from false easting but never approach the theoretical limits.
 #[test]
-#[ignore = "stub: implement when utm projection is complete"]
-fn utm_easting_in_valid_range() {}
+fn utm_easting_in_valid_range() {
+    /*
+     * Sample grid: every 10° longitude × latitudes 0°, ±30°, ±60°, ±83°.
+     * Also probe zone boundaries and dateline vicinity.
+     */
+    let lats: &[f64] = &[0.0, 30.0, 60.0, 83.0, -30.0, -60.0, -80.0];
+    let lons: Vec<f64> = (-180i32..=180).step_by(10).map(|l| l as f64).collect();
+
+    for &lat in lats {
+        for &lon in &lons {
+            if lon == 180.0 {
+                continue; /* 180° == zone 1 CM, already tested */
+            }
+            let coord = GeoCoord::from_degrees(lat, lon, 0.0)
+                .unwrap_or_else(|e| panic!("({lat},{lon}): coord invalid: {e}"));
+
+            let utm = wgs84_to_utm(coord)
+                .unwrap_or_else(|e| panic!("({lat},{lon}): forward failed: {e}"));
+
+            assert!(
+                utm.easting >= 100_000.0 && utm.easting <= 900_000.0,
+                "({lat}°, {lon}°): easting {:.1} outside [100 000, 900 000]",
+                utm.easting,
+            );
+        }
+    }
+}
+
+/// Absolute UTM coordinate spot-checks against independently computed
+/// Karney-Krüger reference values.
+///
+/// Reference values were computed with the identical 6th-order series in
+/// Python (same α coefficients, WGS84 n, A₀). Cross-checked against the
+/// well-known Equator/Zone31 anchor (E = 166 021.44 m) from multiple
+/// geodesy textbooks.
+///
+/// Tolerance: 0.5 m — this is far larger than the sub-mm series accuracy
+/// but guards against coefficient-level regressions (e.g. a wrong α term
+/// would cause errors of many metres).
+#[test]
+fn utm_spot_checks_absolute() {
+    const TOL_M: f64 = 0.5;
+
+    struct Ref {
+        lat: f64,
+        lon: f64,
+        expected_e: f64,
+        expected_n: f64,
+        label: &'static str,
+    }
+
+    let cases = [
+        /*
+         * Equator at 0°E, Zone 31N (CM = 3°E, Δλ = −3°).
+         * Easting 166 021.44 m is a well-known textbook anchor value.
+         * Northing = 0 exactly (equator, northern-hemisphere false northing).
+         */
+        Ref {
+            lat: 0.0,
+            lon: 0.0,
+            expected_e: 166_021.4,
+            expected_n: 0.0,
+            label: "Equator 0°E (Zone31, Δλ=−3°)",
+        },
+        /*
+         * Mid-latitude, Zone 32N central meridian (45°N, 9°E).
+         * Easting = 500 000 exactly (on CM); northing ≈ 4 982 950 m.
+         */
+        Ref {
+            lat: 45.0,
+            lon: 9.0,
+            expected_e: 500_000.0,
+            expected_n: 4_982_950.4,
+            label: "45°N 9°E Zone32 CM (mid-latitude)",
+        },
+        /*
+         * London: verified in unit tests and by independent Python evaluation.
+         * Listed here to protect against integration-level regressions.
+         */
+        Ref {
+            lat: 51.5074,
+            lon: -0.1278,
+            expected_e: 699_316.2,
+            expected_n: 5_710_163.8,
+            label: "London 51.5074°N −0.1278°E (Zone30)",
+        },
+        /*
+         * Near-pole: 83°N, 0°E (Zone 31N). Tests series accuracy at the
+         * northern UTM limit where the Krüger correction is largest.
+         */
+        Ref {
+            lat: 83.0,
+            lon: 0.0,
+            expected_e: 459_200.3,
+            expected_n: 9_217_519.4,
+            label: "83°N 0°E near UTM polar limit (Zone31)",
+        },
+        /*
+         * Sydney, southern hemisphere. False northing (10 000 000 m) is applied;
+         * northing must be less than 10 000 000 for any southern-hemisphere point.
+         */
+        Ref {
+            lat: -33.8688,
+            lon: 151.2093,
+            expected_e: 334_368.6,
+            expected_n: 6_250_948.3,
+            label: "Sydney −33.87°S 151.21°E (Zone56, south hemisphere)",
+        },
+    ];
+
+    for case in &cases {
+        let coord = GeoCoord::from_degrees(case.lat, case.lon, 0.0)
+            .unwrap_or_else(|e| panic!("{}: coord invalid: {e}", case.label));
+
+        let utm = wgs84_to_utm(coord)
+            .unwrap_or_else(|e| panic!("{}: forward failed: {e}", case.label));
+
+        assert_abs_diff_eq!(
+            utm.easting,
+            case.expected_e,
+            epsilon = TOL_M,
+        );
+        assert_abs_diff_eq!(
+            utm.northing,
+            case.expected_n,
+            epsilon = TOL_M,
+        );
+    }
+}
+
+/// Zone selection at boundary conditions.
+///
+/// Norway/Svalbard exceptions (zones 32V, 31X–37X) are NOT tested here:
+/// they apply only to topographic sheets and are out of scope for v0.2.
+/// TODO: add Norwegian/Svalbard exception tests in v0.3+ if needed.
+#[test]
+fn utm_zone_edge_behavior() {
+    /*
+     * −180° and +180° both land on zone 1 (the western edge of zone 1 is
+     * −180°; the eastern edge of zone 60 is +180°, which wraps to zone 1).
+     */
+    assert_eq!(utm_zone(-180.0), 1, "−180° must map to zone 1");
+    assert_eq!(utm_zone(180.0), 1, "180° (dateline) must map to zone 1");
+
+    /*
+     * 179.9999° is still in zone 60 (east of the dateline approaches but
+     * does not reach 180°).
+     */
+    assert_eq!(utm_zone(179.9999), 60, "179.9999° must map to zone 60");
+
+    /*
+     * Zone boundaries lie on exact 6° multiples. The convention used here
+     * (floor division) assigns the boundary longitude to the higher zone.
+     * Example: 6°E → floor((6+180)/6) % 60 + 1 = floor(31) % 60 + 1 = 32.
+     */
+    assert_eq!(utm_zone(6.0), 32, "6°E boundary → zone 32");
+    assert_eq!(utm_zone(-6.0), 30, "−6°E boundary → zone 30");
+    assert_eq!(utm_zone(0.0), 31, "0° prime meridian → zone 31");
+
+    /*
+     * Round-trip at the near-dateline: a point at 179.999°E must survive
+     * the forward/inverse cycle with < 1 mm residual.
+     */
+    let near_dateline =
+        GeoCoord::from_degrees(0.0, 179.999, 0.0).expect("valid near-dateline coord");
+    let utm = wgs84_to_utm(near_dateline).expect("forward near dateline");
+    let (lat_back, lon_back) = utm_to_wgs84(&utm).expect("inverse near dateline");
+    assert_abs_diff_eq!(lat_back, 0.0, epsilon = 1e-9);
+    assert_abs_diff_eq!(lon_back, 179.999, epsilon = 1e-9);
+}
 
 /// EGM96 geoid undulation spot-checks against NIMA TR8350.2 Appendix C values.
 ///
