@@ -68,15 +68,13 @@ fn alpha_coefficients() -> [f64; 6] {
 
     [
         // α₁
-        n / 2.0 - 2.0 * n2 / 3.0 + 5.0 * n3 / 16.0 + 41.0 * n4 / 180.0
-            - 127.0 * n5 / 288.0
+        n / 2.0 - 2.0 * n2 / 3.0 + 5.0 * n3 / 16.0 + 41.0 * n4 / 180.0 - 127.0 * n5 / 288.0
             + 7891.0 * n6 / 37800.0,
         // α₂
         13.0 * n2 / 48.0 - 3.0 * n3 / 5.0 + 557.0 * n4 / 1440.0 + 281.0 * n5 / 630.0
             - 1_983_433.0 * n6 / 1_935_360.0,
         // α₃
-        61.0 * n3 / 240.0 - 103.0 * n4 / 140.0 + 15061.0 * n5 / 26880.0
-            + 167603.0 * n6 / 181440.0,
+        61.0 * n3 / 240.0 - 103.0 * n4 / 140.0 + 15061.0 * n5 / 26880.0 + 167603.0 * n6 / 181440.0,
         // α₄
         49561.0 * n4 / 161_280.0 - 179.0 * n5 / 168.0 + 6_601_661.0 * n6 / 7_257_600.0,
         // α₅
@@ -105,8 +103,7 @@ fn beta_coefficients() -> [f64; 6] {
         -n2 / 48.0 - n3 / 15.0 + 437.0 * n4 / 1440.0 - 46.0 * n5 / 105.0
             + 1_118_711.0 * n6 / 3_870_720.0,
         // β₃
-        -17.0 * n3 / 480.0 + 37.0 * n4 / 840.0 + 209.0 * n5 / 4480.0
-            - 5569.0 * n6 / 90720.0,
+        -17.0 * n3 / 480.0 + 37.0 * n4 / 840.0 + 209.0 * n5 / 4480.0 - 5569.0 * n6 / 90720.0,
         // β₄
         -4397.0 * n4 / 161_280.0 + 11.0 * n5 / 504.0 + 830_251.0 * n6 / 7_257_600.0,
         // β₅
@@ -143,7 +140,7 @@ pub fn wgs84_to_utm(coord: GeoCoord) -> Result<UtmCoord, GeodesyError> {
     let lat_deg = coord.lat_deg();
     let lon_deg = coord.lon_deg();
 
-    if lat_deg < -84.0 || lat_deg > 84.0 {
+    if !(-84.0..=84.0).contains(&lat_deg) {
         return Err(GeodesyError::OutOfBounds {
             lat: lat_deg,
             lon: lon_deg,
@@ -442,7 +439,10 @@ mod tests {
     #[test]
     fn pole_latitude_is_rejected() {
         let pole = GeoCoord::from_degrees(90.0, 0.0, 0.0).unwrap();
-        assert!(wgs84_to_utm(pole).is_err(), "±90° should be rejected by UTM");
+        assert!(
+            wgs84_to_utm(pole).is_err(),
+            "±90° should be rejected by UTM"
+        );
     }
 
     #[test]

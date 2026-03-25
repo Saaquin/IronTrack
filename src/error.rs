@@ -114,7 +114,9 @@ pub enum PhotogrammetryError {
     ///
     /// `computed_m`: AGL that would satisfy the GSD target (from sensor math).
     /// `min_safe_m`: platform minimum from `MissionParams::min_clearance_m`.
-    #[error("computed AGL {computed_m:.1}m is below minimum safe operating altitude {min_safe_m:.1}m")]
+    #[error(
+        "computed AGL {computed_m:.1}m is below minimum safe operating altitude {min_safe_m:.1}m"
+    )]
     UnsafeAltitude { computed_m: f64, min_safe_m: f64 },
     /// General parameter validation failure for non-sensor, non-overlap inputs
     /// (e.g., degenerate bounding box, non-finite azimuth). Carries a

@@ -23,7 +23,9 @@
 
 use approx::assert_abs_diff_eq;
 use irontrack::geodesy::geoid::geoid_undulation;
-use irontrack::photogrammetry::flightlines::{generate_flight_lines, BoundingBox, FlightPlanParams};
+use irontrack::photogrammetry::flightlines::{
+    generate_flight_lines, BoundingBox, FlightPlanParams,
+};
 use irontrack::types::SensorParams;
 
 /// Karney inverse geodesic against the GeodTest reference dataset.
@@ -74,16 +76,41 @@ fn geoid_undulation_nima_reference_points() {
 
     let cases = [
         // Gulf of Guinea — near-equator anchor from NIMA TR8350.2 Appendix C.
-        Ref { lat:   0.0, lon:   0.0, n_m:  17.16, label: "Gulf of Guinea (0°N 0°E)" },
+        Ref {
+            lat: 0.0,
+            lon: 0.0,
+            n_m: 17.16,
+            label: "Gulf of Guinea (0°N 0°E)",
+        },
         // North Pole — all longitudes converge; tabulated in NIMA Appendix C.
-        Ref { lat:  90.0, lon:   0.0, n_m:  13.61, label: "North Pole (90°N)" },
+        Ref {
+            lat: 90.0,
+            lon: 0.0,
+            n_m: 13.61,
+            label: "North Pole (90°N)",
+        },
         // South Pole — NIMA TR8350.2: N ≈ −29.5 m.
-        Ref { lat: -90.0, lon:   0.0, n_m: -29.5,  label: "South Pole (90°S)" },
+        Ref {
+            lat: -90.0,
+            lon: 0.0,
+            n_m: -29.5,
+            label: "South Pole (90°S)",
+        },
         // Indian Ocean gravity low — global geoid minimum region (~−106 m).
         // Conservative bound: actual < −90 m.
-        Ref { lat:  -1.0, lon:  81.0, n_m: -100.0, label: "Indian Ocean gravity low (threshold)" },
+        Ref {
+            lat: -1.0,
+            lon: 81.0,
+            n_m: -100.0,
+            label: "Indian Ocean gravity low (threshold)",
+        },
         // Denver, CO — CONUS representative; NIMA: approximately −18 m.
-        Ref { lat:  39.7, lon: -104.9, n_m: -18.0, label: "Denver, CO (CONUS)" },
+        Ref {
+            lat: 39.7,
+            lon: -104.9,
+            n_m: -18.0,
+            label: "Denver, CO (CONUS)",
+        },
     ];
 
     /*
@@ -103,8 +130,12 @@ fn geoid_undulation_nima_reference_points() {
                 n
             );
         } else {
-            assert_abs_diff_eq!(n, case.n_m, epsilon = TOL * 3.0,
-                /* wider tolerance for regions far from tabulated NIMA anchor points */);
+            assert_abs_diff_eq!(
+                n,
+                case.n_m,
+                epsilon = TOL * 3.0,
+                /* wider tolerance for regions far from tabulated NIMA anchor points */
+            );
         }
     }
 }
@@ -150,14 +181,13 @@ fn kahan_sum_no_drift_large_accumulation() {
      * dimension so the Kahan accumulator takes many steps per line.
      */
     let bbox = BoundingBox {
-        min_lat:  0.0,
-        max_lat:  0.09,   // ~10 km N–S
-        min_lon:  0.0,
-        max_lon:  1.80,   // ~200 km E–W at the equator
+        min_lat: 0.0,
+        max_lat: 0.09, // ~10 km N–S
+        min_lon: 0.0,
+        max_lon: 1.80, // ~200 km E–W at the equator
     };
 
-    let plan = generate_flight_lines(&bbox, 90.0, &params)
-        .expect("valid flight plan");
+    let plan = generate_flight_lines(&bbox, 90.0, &params).expect("valid flight plan");
 
     assert!(
         plan.lines.len() >= 1,

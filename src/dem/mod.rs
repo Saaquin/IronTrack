@@ -350,10 +350,8 @@ impl TerrainEngine {
         keys.dedup();
 
         for (tile_lat, tile_lon) in keys {
-            self.dem.elevation_at(
-                tile_lat as f64 + 0.5,
-                tile_lon as f64 + 0.5,
-            )?;
+            self.dem
+                .elevation_at(tile_lat as f64 + 0.5, tile_lon as f64 + 0.5)?;
         }
 
         /*

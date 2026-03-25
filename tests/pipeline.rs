@@ -26,7 +26,9 @@
 
 use irontrack::gpkg::GeoPackage;
 use irontrack::io::write_geojson;
-use irontrack::photogrammetry::flightlines::{generate_flight_lines, BoundingBox, FlightPlanParams};
+use irontrack::photogrammetry::flightlines::{
+    generate_flight_lines, BoundingBox, FlightPlanParams,
+};
 use irontrack::types::SensorParams;
 use tempfile::tempdir;
 
@@ -77,7 +79,10 @@ fn full_pipeline_gpkg_and_geojson_are_created() {
     let geojson_path = dir.path().join("plan.geojson");
 
     let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
-    assert!(!plan.lines.is_empty(), "plan must have at least one flight line");
+    assert!(
+        !plan.lines.is_empty(),
+        "plan must have at least one flight line"
+    );
 
     // --- GeoPackage export -------------------------------------------------
     let gpkg = GeoPackage::new(&gpkg_path).unwrap();
@@ -124,7 +129,10 @@ fn gpkg_rtree_entry_count_matches_plan_line_count() {
     gpkg.insert_flight_plan("flight_lines", &plan).unwrap();
 
     let rtree_count = gpkg.count_rtree_entries("flight_lines").unwrap();
-    assert_eq!(rtree_count, n_lines as i64, "one R-tree entry per flight line");
+    assert_eq!(
+        rtree_count, n_lines as i64,
+        "one R-tree entry per flight line"
+    );
 }
 
 #[test]
@@ -166,7 +174,11 @@ fn geojson_feature_count_matches_plan_line_count() {
 
     assert_eq!(fc["type"], "FeatureCollection");
     let features = fc["features"].as_array().unwrap();
-    assert_eq!(features.len(), n_lines, "one GeoJSON feature per flight line");
+    assert_eq!(
+        features.len(),
+        n_lines,
+        "one GeoJSON feature per flight line"
+    );
 }
 
 #[test]

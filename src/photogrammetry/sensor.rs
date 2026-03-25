@@ -40,11 +40,14 @@ impl SensorParams {
     /// (typically along-track). Derived from similar-triangles collinearity:
     ///   GSD = (AGL * sensor_dimension) / (focal_length * pixel_count)
     pub fn gsd_at_agl(&self, agl_m: f64) -> (f64, f64) {
-        debug_assert!(agl_m > 0.0 && agl_m.is_finite(), "agl_m must be positive and finite");
-        let gsd_x = (agl_m * self.sensor_width_mm)
-            / (self.focal_length_mm * self.image_width_px as f64);
-        let gsd_y = (agl_m * self.sensor_height_mm)
-            / (self.focal_length_mm * self.image_height_px as f64);
+        debug_assert!(
+            agl_m > 0.0 && agl_m.is_finite(),
+            "agl_m must be positive and finite"
+        );
+        let gsd_x =
+            (agl_m * self.sensor_width_mm) / (self.focal_length_mm * self.image_width_px as f64);
+        let gsd_y =
+            (agl_m * self.sensor_height_mm) / (self.focal_length_mm * self.image_height_px as f64);
         (gsd_x, gsd_y)
     }
 
@@ -82,17 +85,18 @@ impl SensorParams {
     /// equals the target:
     ///   AGL = target_gsd / max(sensor_w/(f*W), sensor_h/(f*H))
     pub fn required_agl_for_gsd(&self, target_gsd_m: f64) -> f64 {
-        debug_assert!(target_gsd_m > 0.0 && target_gsd_m.is_finite(), "target_gsd_m must be positive and finite");
+        debug_assert!(
+            target_gsd_m > 0.0 && target_gsd_m.is_finite(),
+            "target_gsd_m must be positive and finite"
+        );
         /*
          * Each axis contributes a GSD-per-unit-AGL rate. The binding dimension
          * (the one that produces the worst-case GSD at any given altitude) is
          * the one with the highest rate. Dividing the target GSD by that rate
          * gives the maximum AGL at which worst_case_gsd == target_gsd_m.
          */
-        let rate_x = self.sensor_width_mm
-            / (self.focal_length_mm * self.image_width_px as f64);
-        let rate_y = self.sensor_height_mm
-            / (self.focal_length_mm * self.image_height_px as f64);
+        let rate_x = self.sensor_width_mm / (self.focal_length_mm * self.image_width_px as f64);
+        let rate_y = self.sensor_height_mm / (self.focal_length_mm * self.image_height_px as f64);
         target_gsd_m / rate_x.max(rate_y)
     }
 }
@@ -219,8 +223,16 @@ mod tests {
     #[test]
     fn swath_linear_with_agl() {
         let s = ixm100();
-        assert_abs_diff_eq!(s.swath_width(500.0), s.swath_width(1000.0) / 2.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(s.swath_height(500.0), s.swath_height(1000.0) / 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            s.swath_width(500.0),
+            s.swath_width(1000.0) / 2.0,
+            epsilon = 1e-9
+        );
+        assert_abs_diff_eq!(
+            s.swath_height(500.0),
+            s.swath_height(1000.0) / 2.0,
+            epsilon = 1e-9
+        );
     }
 
     #[test]

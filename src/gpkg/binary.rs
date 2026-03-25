@@ -83,10 +83,10 @@ pub fn encode_linestring_z(coords: &[(f64, f64, f64)], srs_id: i32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + 48 + 9 + coords.len() * 24);
     buf.extend_from_slice(&[0x47, 0x50]); // magic "GP"
     buf.push(0x00); // version
-    /*
-     * Flags byte: B=1 (LE), E=010 (3D envelope = 6 × f64 = 48 bytes)
-     * flags = (E << 1) | B = (2 << 1) | 1 = 0b00000101 = 0x05
-     */
+                    /*
+                     * Flags byte: B=1 (LE), E=010 (3D envelope = 6 × f64 = 48 bytes)
+                     * flags = (E << 1) | B = (2 << 1) | 1 = 0b00000101 = 0x05
+                     */
     buf.push(0x05);
     buf.extend_from_slice(&srs_id.to_le_bytes());
     // 3D envelope: minx, maxx, miny, maxy, minz, maxz

@@ -121,8 +121,8 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use tempfile::tempdir;
 
-    use crate::photogrammetry::FlightPlan;
     use crate::photogrammetry::flightlines::FlightPlanParams;
+    use crate::photogrammetry::FlightPlan;
     use crate::types::{FlightLine, SensorParams};
 
     fn minimal_plan(n_lines: usize, pts_per_line: usize) -> FlightPlan {
@@ -214,9 +214,21 @@ mod tests {
         let fc = flight_plan_to_geojson(&plan);
         let props = &fc["features"][0]["properties"];
         assert_eq!(props["line_index"], 0);
-        assert_abs_diff_eq!(props["target_gsd_m"].as_f64().unwrap(), 0.05, epsilon = 1e-12);
-        assert_abs_diff_eq!(props["side_lap_pct"].as_f64().unwrap(), 60.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(props["end_lap_pct"].as_f64().unwrap(), 80.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            props["target_gsd_m"].as_f64().unwrap(),
+            0.05,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            props["side_lap_pct"].as_f64().unwrap(),
+            60.0,
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(
+            props["end_lap_pct"].as_f64().unwrap(),
+            80.0,
+            epsilon = 1e-12
+        );
         // minimal_plan pushes elevation=100.0 for every waypoint, so both min and max are 100.0
         assert_abs_diff_eq!(
             props["min_altitude_msl_m"].as_f64().unwrap(),

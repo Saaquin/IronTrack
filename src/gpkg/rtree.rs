@@ -27,10 +27,7 @@
 // that references them can fire.
 
 use crate::error::GpkgError;
-use rusqlite::{
-    functions::FunctionFlags,
-    Connection,
-};
+use rusqlite::{functions::FunctionFlags, Connection};
 
 use super::binary::{
     parse_envelope_maxx, parse_envelope_maxy, parse_envelope_minx, parse_envelope_miny,

@@ -291,16 +291,16 @@ mod tests {
             buf.extend_from_slice(&val.to_le_bytes());
         };
 
-        entry(256, 3, 1, cols);           // ImageWidth (SHORT)
-        entry(257, 3, 1, rows);           // ImageLength (SHORT)
-        entry(258, 3, 1, 32);             // BitsPerSample = 32
-        entry(259, 3, 1, 1);              // Compression = none
-        entry(262, 3, 1, 1);              // PhotometricInterpretation
-        entry(273, 4, 1, data_offset);    // StripOffsets (LONG)
-        entry(277, 3, 1, 1);              // SamplesPerPixel = 1
-        entry(278, 3, 1, rows);           // RowsPerStrip
-        entry(279, 4, 1, data_bytes);     // StripByteCounts (LONG)
-        entry(339, 3, 1, 3);              // SampleFormat = 3 (IEEE float)
+        entry(256, 3, 1, cols); // ImageWidth (SHORT)
+        entry(257, 3, 1, rows); // ImageLength (SHORT)
+        entry(258, 3, 1, 32); // BitsPerSample = 32
+        entry(259, 3, 1, 1); // Compression = none
+        entry(262, 3, 1, 1); // PhotometricInterpretation
+        entry(273, 4, 1, data_offset); // StripOffsets (LONG)
+        entry(277, 3, 1, 1); // SamplesPerPixel = 1
+        entry(278, 3, 1, rows); // RowsPerStrip
+        entry(279, 4, 1, data_bytes); // StripByteCounts (LONG)
+        entry(339, 3, 1, 3); // SampleFormat = 3 (IEEE float)
 
         // Next IFD offset (0 = end of chain)
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -317,8 +317,8 @@ mod tests {
     #[test]
     fn flat_tile_returns_correct_elevation() {
         let data = make_flat_f32_tiff(300.0, 10, 10);
-        let tile = CopernicusTile::from_reader(Cursor::new(data), 47, -122)
-            .expect("parse flat tile");
+        let tile =
+            CopernicusTile::from_reader(Cursor::new(data), 47, -122).expect("parse flat tile");
         let h = tile.elevation_at(47.5, -121.5).expect("elevation");
         assert_abs_diff_eq!(h as f64, 300.0, epsilon = 1e-4);
     }
@@ -358,8 +358,8 @@ mod tests {
             buf.extend_from_slice(&v.to_le_bytes());
         }
 
-        let tile = CopernicusTile::from_reader(Cursor::new(buf), 0, 0)
-            .expect("parse tile with void");
+        let tile =
+            CopernicusTile::from_reader(Cursor::new(buf), 0, 0).expect("parse tile with void");
 
         /*
          * Query at the SE corner of a 2×2 tile (lat=tile_lat, lon=tile_lon+1):
@@ -467,17 +467,17 @@ mod tests {
             buf.extend_from_slice(&val.to_le_bytes());
         };
 
-        entry(256, 3, 1, cols as u32);     // ImageWidth
-        entry(257, 3, 1, rows as u32);     // ImageLength
-        entry(258, 3, 1, 32);              // BitsPerSample = 32
-        entry(259, 3, 1, 8);               // Compression = 8 (DEFLATE)
-        entry(262, 3, 1, 1);               // PhotometricInterpretation
-        entry(273, 4, 1, data_offset);     // StripOffsets
-        entry(277, 3, 1, 1);               // SamplesPerPixel
-        entry(278, 3, 1, rows as u32);     // RowsPerStrip
-        entry(279, 4, 1, data_bytes);      // StripByteCounts (compressed)
-        entry(317, 3, 1, 3);               // Predictor = 3 (FloatingPoint)
-        entry(339, 3, 1, 3);               // SampleFormat = 3 (IEEE float)
+        entry(256, 3, 1, cols as u32); // ImageWidth
+        entry(257, 3, 1, rows as u32); // ImageLength
+        entry(258, 3, 1, 32); // BitsPerSample = 32
+        entry(259, 3, 1, 8); // Compression = 8 (DEFLATE)
+        entry(262, 3, 1, 1); // PhotometricInterpretation
+        entry(273, 4, 1, data_offset); // StripOffsets
+        entry(277, 3, 1, 1); // SamplesPerPixel
+        entry(278, 3, 1, rows as u32); // RowsPerStrip
+        entry(279, 4, 1, data_bytes); // StripByteCounts (compressed)
+        entry(317, 3, 1, 3); // Predictor = 3 (FloatingPoint)
+        entry(339, 3, 1, 3); // SampleFormat = 3 (IEEE float)
 
         buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
         buf.extend_from_slice(&compressed);
@@ -485,7 +485,9 @@ mod tests {
         let tile = CopernicusTile::from_reader(Cursor::new(buf), 0, 0)
             .expect("DEFLATE + FloatingPoint predictor round-trip must succeed");
 
-        let h = tile.elevation_at(0.5, 0.5).expect("elevation from compressed tile");
+        let h = tile
+            .elevation_at(0.5, 0.5)
+            .expect("elevation from compressed tile");
         assert_abs_diff_eq!(h as f64, value as f64, epsilon = 1e-4);
     }
 
@@ -512,14 +514,14 @@ mod tests {
         };
         entry(256, 3, 1, cols);
         entry(257, 3, 1, rows);
-        entry(258, 3, 1, 16);            // BitsPerSample = 16
+        entry(258, 3, 1, 16); // BitsPerSample = 16
         entry(259, 3, 1, 1);
         entry(262, 3, 1, 1);
         entry(273, 4, 1, data_offset);
         entry(277, 3, 1, 1);
         entry(278, 3, 1, rows);
         entry(279, 4, 1, data_bytes);
-        entry(339, 3, 1, 1);             // SampleFormat = 1 (unsigned int)
+        entry(339, 3, 1, 1); // SampleFormat = 1 (unsigned int)
         buf.extend_from_slice(&0u32.to_le_bytes());
 
         for _ in 0..pixel_count {

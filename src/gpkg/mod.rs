@@ -68,11 +68,9 @@ mod tests {
 
         let count: i32 = gpkg
             .conn
-            .query_row(
-                "SELECT count(*) FROM rtree_flight_lines_geom",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM rtree_flight_lines_geom", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1, "one R-tree entry should exist after the insert");
     }

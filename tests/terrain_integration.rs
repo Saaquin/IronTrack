@@ -69,16 +69,16 @@ fn make_flat_f32_tiff(value: f32, rows: u32, cols: u32) -> Vec<u8> {
         buf.extend_from_slice(&val.to_le_bytes());
     };
 
-    entry(256, 3, 1, cols);        // ImageWidth (SHORT)
-    entry(257, 3, 1, rows);        // ImageLength (SHORT)
-    entry(258, 3, 1, 32);          // BitsPerSample = 32
-    entry(259, 3, 1, 1);           // Compression = none
-    entry(262, 3, 1, 1);           // PhotometricInterpretation
+    entry(256, 3, 1, cols); // ImageWidth (SHORT)
+    entry(257, 3, 1, rows); // ImageLength (SHORT)
+    entry(258, 3, 1, 32); // BitsPerSample = 32
+    entry(259, 3, 1, 1); // Compression = none
+    entry(262, 3, 1, 1); // PhotometricInterpretation
     entry(273, 4, 1, data_offset); // StripOffsets (LONG)
-    entry(277, 3, 1, 1);           // SamplesPerPixel = 1
-    entry(278, 3, 1, rows);        // RowsPerStrip
-    entry(279, 4, 1, data_bytes);  // StripByteCounts (LONG)
-    entry(339, 3, 1, 3);           // SampleFormat = 3 (IEEE float)
+    entry(277, 3, 1, 1); // SamplesPerPixel = 1
+    entry(278, 3, 1, rows); // RowsPerStrip
+    entry(279, 4, 1, data_bytes); // StripByteCounts (LONG)
+    entry(339, 3, 1, 3); // SampleFormat = 3 (IEEE float)
 
     // Next IFD offset (0 = end of chain)
     buf.extend_from_slice(&0u32.to_le_bytes());

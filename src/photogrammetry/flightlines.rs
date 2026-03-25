@@ -264,10 +264,7 @@ pub fn generate_flight_lines(
      * Karney solver. This matches the invariant enforced by GeoCoord and
      * TerrainEngine elsewhere in the codebase.
      */
-    if bbox.min_lat < -90.0
-        || bbox.max_lat > 90.0
-        || bbox.min_lon < -180.0
-        || bbox.max_lon > 180.0
+    if bbox.min_lat < -90.0 || bbox.max_lat > 90.0 || bbox.min_lon < -180.0 || bbox.max_lon > 180.0
     {
         return Err(PhotogrammetryError::InvalidInput(format!(
             "bbox coordinates outside WGS84 bounds: lat [{:.4},{:.4}], lon [{:.4},{:.4}]",
@@ -282,7 +279,11 @@ pub fn generate_flight_lines(
     // Normalise to [0, 360) for consistent cross_azi computation and tracing.
     let azimuth_deg = {
         let a = azimuth_deg % 360.0;
-        if a < 0.0 { a + 360.0 } else { a }
+        if a < 0.0 {
+            a + 360.0
+        } else {
+            a
+        }
     };
 
     let spacing = params.flight_line_spacing();
@@ -300,7 +301,9 @@ pub fn generate_flight_lines(
      * For the flat-terrain case without an explicit MSL override, the terrain
      * is treated as 0 m MSL and the aircraft flies at nominal_agl above it.
      */
-    let flight_alt_m = params.flight_altitude_msl.unwrap_or_else(|| params.nominal_agl());
+    let flight_alt_m = params
+        .flight_altitude_msl
+        .unwrap_or_else(|| params.nominal_agl());
 
     // --- Decompose bbox corners into cross-track / along-track extents -----
 
@@ -544,8 +547,7 @@ pub fn validate_overlap(
      * from the global waypoint index without touching the input slice inside
      * a Rayon closure.
      */
-    let mut wp_meta: Vec<(usize, usize, f64, f64, f64)> =
-        Vec::with_capacity(total_waypoints);
+    let mut wp_meta: Vec<(usize, usize, f64, f64, f64)> = Vec::with_capacity(total_waypoints);
 
     for (li, line) in plan.lines.iter().enumerate() {
         for (pi, (&lat_rad, (&lon_rad, &alt_m))) in line
@@ -557,9 +559,14 @@ pub fn validate_overlap(
             let lat_deg = lat_rad.to_degrees();
             let lon_deg = lon_rad.to_degrees();
             push_footprint_samples(
-                lat_deg, lon_deg, azimuth_deg,
-                half_cross, half_along, &geod,
-                &mut sample_lats, &mut sample_lons,
+                lat_deg,
+                lon_deg,
+                azimuth_deg,
+                half_cross,
+                half_along,
+                &geod,
+                &mut sample_lats,
+                &mut sample_lons,
             );
             wp_meta.push((li, pi, lat_deg, lon_deg, alt_m));
         }
@@ -659,9 +666,14 @@ pub fn adjust_for_terrain(
             .zip(line.lons().iter().zip(line.elevations().iter()))
         {
             push_footprint_samples(
-                lat_rad.to_degrees(), lon_rad.to_degrees(), azimuth_deg,
-                half_cross, half_along, &geod,
-                &mut sample_lats, &mut sample_lons,
+                lat_rad.to_degrees(),
+                lon_rad.to_degrees(),
+                azimuth_deg,
+                half_cross,
+                half_along,
+                &geod,
+                &mut sample_lats,
+                &mut sample_lons,
             );
             wp_data.push((lat_rad, lon_rad, alt_m));
         }
@@ -853,7 +865,12 @@ mod tests {
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
         for (i, line) in plan.lines.iter().enumerate() {
-            assert_eq!(line.len(), 17, "line {i}: expected 17 waypoints, got {}", line.len());
+            assert_eq!(
+                line.len(),
+                17,
+                "line {i}: expected 17 waypoints, got {}",
+                line.len()
+            );
         }
     }
 
@@ -1110,14 +1127,14 @@ mod tests {
         entry(256, 3, 1, cols);
         entry(257, 3, 1, rows);
         entry(258, 3, 1, 32);
-        entry(259, 3, 1, 8);            // Compression = DEFLATE
+        entry(259, 3, 1, 8); // Compression = DEFLATE
         entry(262, 3, 1, 1);
         entry(273, 4, 1, data_offset);
         entry(277, 3, 1, 1);
         entry(278, 3, 1, rows);
         entry(279, 4, 1, data_bytes);
-        entry(317, 3, 1, 3);            // Predictor = FloatingPoint
-        entry(339, 3, 1, 3);            // SampleFormat = IEEE float
+        entry(317, 3, 1, 3); // Predictor = FloatingPoint
+        entry(339, 3, 1, 3); // SampleFormat = IEEE float
 
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&compressed);
@@ -1140,9 +1157,7 @@ mod tests {
      * All four tiles are written with the same uniform elevation so that the
      * bilinear peak is consistent across every exposure point.
      */
-    fn flat_terrain_engine(
-        elevation_m: f32,
-    ) -> (tempfile::TempDir, crate::dem::TerrainEngine) {
+    fn flat_terrain_engine(elevation_m: f32) -> (tempfile::TempDir, crate::dem::TerrainEngine) {
         use std::fs;
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let tiff = make_flat_f32_tiff(elevation_m, 10, 10);
@@ -1175,8 +1190,7 @@ mod tests {
             assert!(
                 !r.violation,
                 "expected no violation at line {}, point {}",
-                r.line_index,
-                r.point_index
+                r.line_index, r.point_index
             );
             assert_abs_diff_eq!(r.terrain_peak_m, 0.0, epsilon = 1e-3);
         }
@@ -1255,9 +1269,17 @@ mod tests {
         let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
         let adjusted = adjust_for_terrain(&plan, &engine).unwrap();
 
-        assert_eq!(adjusted.lines.len(), plan.lines.len(), "line count must be unchanged");
+        assert_eq!(
+            adjusted.lines.len(),
+            plan.lines.len(),
+            "line count must be unchanged"
+        );
         for (orig, adj) in plan.lines.iter().zip(adjusted.lines.iter()) {
-            assert_eq!(adj.len(), orig.len(), "waypoint count must be unchanged per line");
+            assert_eq!(
+                adj.len(),
+                orig.len(),
+                "waypoint count must be unchanged per line"
+            );
         }
     }
 

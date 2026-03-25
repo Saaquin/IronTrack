@@ -81,7 +81,6 @@ enum Commands {
     ///     --output plan.gpkg --geojson plan.geojson
     Plan {
         // --- Bounding box ---------------------------------------------------
-
         /// Minimum (south) latitude in decimal degrees.
         #[arg(long)]
         min_lat: f64,
@@ -96,7 +95,6 @@ enum Commands {
         max_lon: f64,
 
         // --- Sensor ---------------------------------------------------------
-
         /// Sensor preset. Choices: phantom4pro, mavic3, ixm100.
         /// Ignored when --focal-length-mm is supplied.
         #[arg(long, default_value = "phantom4pro", value_name = "PRESET")]
@@ -119,7 +117,6 @@ enum Commands {
         image_height_px: Option<u32>,
 
         // --- Photogrammetry -------------------------------------------------
-
         /// Target ground sample distance in cm/px (e.g. 3.0 → 3 cm/px).
         #[arg(long, default_value = "5.0", value_name = "CM")]
         gsd_cm: f64,
@@ -143,7 +140,6 @@ enum Commands {
         altitude_msl: Option<f64>,
 
         // --- Terrain --------------------------------------------------------
-
         /// Run terrain-aware validation and altitude adjustment using cached
         /// Copernicus DEM tiles. If a required tile is not in the local cache
         /// it will be downloaded automatically. The flat-terrain plan is used
@@ -152,7 +148,6 @@ enum Commands {
         terrain: bool,
 
         // --- Output ---------------------------------------------------------
-
         /// GeoPackage output file path.
         #[arg(long, value_name = "PATH")]
         output: PathBuf,
@@ -269,7 +264,10 @@ fn run_terrain(lat: f64, lon: f64) -> Result<()> {
     println!("Location: {lat_label}, {lon_label}");
     println!("Orthometric elevation: {:.1} m (MSL)", report.orthometric_m);
     println!("Geoid undulation (N): {:.1} m", report.geoid_undulation_m);
-    println!("Ellipsoidal elevation: {:.1} m (WGS84)", report.ellipsoidal_m);
+    println!(
+        "Ellipsoidal elevation: {:.1} m (WGS84)",
+        report.ellipsoidal_m
+    );
     Ok(())
 }
 
@@ -474,8 +472,7 @@ fn print_summary(plan: &FlightPlan, params: &FlightPlanParams, gsd_cm: f64, sens
 
     const CRUISE_SPEED_MS: f64 = 12.0;
     const TURN_TIME_S: f64 = 30.0;
-    let flight_time_s =
-        total_distance_km * 1000.0 / CRUISE_SPEED_MS + n_lines as f64 * TURN_TIME_S;
+    let flight_time_s = total_distance_km * 1000.0 / CRUISE_SPEED_MS + n_lines as f64 * TURN_TIME_S;
     let flight_time_min = flight_time_s / 60.0;
 
     println!();

@@ -70,12 +70,8 @@ pub fn geodesic_inverse(a: GeoCoord, b: GeoCoord) -> GeodesicInverse {
      * only degree arithmetic that should appear in this module.
      */
     /* (s12, azi1, azi2, a12) — use the 4-tuple impl to get distance and azimuths together */
-    let (distance_m, azimuth1_deg, azimuth2_deg, _a12): (f64, f64, f64, f64) = geod.inverse(
-        a.lat_deg(),
-        a.lon_deg(),
-        b.lat_deg(),
-        b.lon_deg(),
-    );
+    let (distance_m, azimuth1_deg, azimuth2_deg, _a12): (f64, f64, f64, f64) =
+        geod.inverse(a.lat_deg(), a.lon_deg(), b.lat_deg(), b.lon_deg());
 
     GeodesicInverse {
         distance_m,

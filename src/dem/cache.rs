@@ -186,9 +186,8 @@ impl DemCache {
         let url = copernicus_url(lat, lon);
         let name = tile_filename(lat, lon);
 
-        let response = reqwest::blocking::get(&url).map_err(|e| {
-            DemError::CacheFailure(format!("HTTP request failed for {name}: {e}"))
-        })?;
+        let response = reqwest::blocking::get(&url)
+            .map_err(|e| DemError::CacheFailure(format!("HTTP request failed for {name}: {e}")))?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             /*
@@ -341,9 +340,9 @@ impl DemProvider {
                     .map(|v| v as f64)
                     .ok_or_else(|| {
                         DemError::NoData(format!(
-                    "void or water-body post at ({lat:.6}°, {lon:.6}°) — \
+                            "void or water-body post at ({lat:.6}°, {lon:.6}°) — \
                      no elevation data at this location (ocean, lake, or DEM void)"
-                ))
+                        ))
                     });
             }
         }
@@ -362,10 +361,12 @@ impl DemProvider {
 
         tile.elevation_at(lat, lon)
             .map(|v| v as f64)
-            .ok_or_else(|| DemError::NoData(format!(
+            .ok_or_else(|| {
+                DemError::NoData(format!(
                     "void or water-body post at ({lat:.6}°, {lon:.6}°) — \
                      no elevation data at this location (ocean, lake, or DEM void)"
-                )))
+                ))
+            })
     }
 }
 
@@ -523,7 +524,8 @@ mod tests {
         let cache = DemCache::with_dir(dir.path().to_path_buf()).expect("cache");
         let err = cache.get_tile(47, -122).unwrap_err();
         assert!(
-            err.to_string().contains("copernicus-dem-30m.s3.amazonaws.com"),
+            err.to_string()
+                .contains("copernicus-dem-30m.s3.amazonaws.com"),
             "error should contain Copernicus S3 URL: {err}"
         );
     }

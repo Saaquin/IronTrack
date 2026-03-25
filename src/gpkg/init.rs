@@ -299,11 +299,7 @@ impl GeoPackage {
     /// database is rolled back to its pre-call state — no partial rows remain.
     ///
     /// The table must have been created with `create_feature_table` first.
-    pub fn insert_flight_plan(
-        &self,
-        table_name: &str,
-        plan: &FlightPlan,
-    ) -> Result<(), GpkgError> {
+    pub fn insert_flight_plan(&self, table_name: &str, plan: &FlightPlan) -> Result<(), GpkgError> {
         validate_identifier(table_name)?;
 
         /*
@@ -374,11 +370,11 @@ impl GeoPackage {
     /// the internal `Connection`.
     pub fn count_rows(&self, table_name: &str) -> Result<i64, GpkgError> {
         validate_identifier(table_name)?;
-        let count: i64 = self.conn.query_row(
-            &format!("SELECT count(*) FROM {table_name}"),
-            [],
-            |r| r.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row(&format!("SELECT count(*) FROM {table_name}"), [], |r| {
+                    r.get(0)
+                })?;
         Ok(count)
     }
 
@@ -460,10 +456,7 @@ fn validate_identifier(name: &str) -> Result<(), GpkgError> {
     if name.is_empty() {
         return Err(GpkgError::Init("identifier must not be empty".into()));
     }
-    if name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         Ok(())
     } else {
         Err(GpkgError::Init(format!(
@@ -587,7 +580,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("round_trip.gpkg");
         // Create and close
-        { GeoPackage::new(&path).unwrap(); }
+        {
+            GeoPackage::new(&path).unwrap();
+        }
         // Re-open and verify the mandatory tables survived
         let gpkg = GeoPackage::open(&path).unwrap();
         let count: i32 = gpkg
