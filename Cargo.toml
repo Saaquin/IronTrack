@@ -1,0 +1,30 @@
+[package]
+name = "irontrack"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Open-source flight management and aerial survey planning engine"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+egm96 = { version = "0.2", default-features = false }
+egm2008 = "0.1"
+geographiclib-rs = "0.2"
+byteorder = "1"
+dirs = "5"
+reqwest = { version = "0.12", features = ["blocking"] }
+tiff = "0.9"
+tempfile = "3"
+thiserror = "1"
+anyhow = "1"
+
+[patch.crates-io]
+egm96 = { path = "vendor/egm96" }
+
+[dev-dependencies]
+approx = "0.5"
+flate2 = "1"

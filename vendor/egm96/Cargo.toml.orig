@@ -1,0 +1,30 @@
+[package]
+name = "egm96"
+version.workspace = true
+description.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme.workspace = true
+exclude = ["data"]
+
+[dependencies]
+png = {version = "0.17", optional = true }
+
+[build-dependencies]
+reqwest = { version = "0" , features = ["blocking", "native-tls-vendored"], optional = true}
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[[bench]]
+name = "undulation_bench"
+harness = false
+
+[features]
+default = ["fetch-maps", "raster_5_min"]
+raster_5_min = ["dep:png"]
+raster_15_min = ["dep:png"]
+fetch-maps = ["dep:reqwest"]
