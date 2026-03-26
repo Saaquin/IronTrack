@@ -32,6 +32,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::GpkgError;
 use crate::photogrammetry::FlightPlan;
+use crate::types::AltitudeDatum;
 
 use super::binary;
 use super::rtree;
@@ -342,6 +343,25 @@ impl GeoPackage {
                     params![min_x, min_y, max_x, max_y, table_name],
                 )?;
             }
+
+            /*
+             * Write the altitude datum tag to gpkg_contents.description so
+             * downstream readers know the vertical reference without parsing
+             * geometry. Derive from first line; fall back to EGM2008 for
+             * empty plans (description is informational, not load-bearing).
+             */
+            let datum_str = plan
+                .lines
+                .first()
+                .map(|l| l.altitude_datum.as_str())
+                .unwrap_or(AltitudeDatum::Egm2008.as_str());
+            self.conn.execute(
+                "UPDATE gpkg_contents SET description=?1 WHERE table_name=?2",
+                params![
+                    format!("altitude_datum={datum_str}"),
+                    table_name
+                ],
+            )?;
 
             Ok::<(), GpkgError>(())
         })();

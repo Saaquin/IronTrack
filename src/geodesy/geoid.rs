@@ -300,7 +300,7 @@ impl Egm2008Model {
 ///
 /// Returns [`GeodesyError::OutOfBounds`] if `lat_deg` is outside ±90° or
 /// either coordinate is non-finite.
-pub fn geoid_undulation(lat_deg: f64, lon_deg: f64) -> Result<f64, GeodesyError> {
+pub fn geoid_undulation_egm96(lat_deg: f64, lon_deg: f64) -> Result<f64, GeodesyError> {
     GeoidModel::new().undulation(lat_deg, lon_deg)
 }
 
@@ -357,14 +357,14 @@ mod tests {
     #[test]
     fn undulation_at_origin() {
         // 0°N 0°E — Gulf of Guinea. NIMA TR8350.2 Appendix C: N ≈ +17.16 m.
-        let n = geoid_undulation(0.0, 0.0).expect("valid coordinates");
+        let n = geoid_undulation_egm96(0.0, 0.0).expect("valid coordinates");
         assert_abs_diff_eq!(n, 17.16, epsilon = TOLERANCE_M);
     }
 
     #[test]
     fn undulation_north_pole() {
         // 90°N 0°E — North Pole. NIMA TR8350.2: N ≈ +13.61 m.
-        let n = geoid_undulation(90.0, 0.0).expect("valid coordinates");
+        let n = geoid_undulation_egm96(90.0, 0.0).expect("valid coordinates");
         assert_abs_diff_eq!(n, 13.61, epsilon = TOLERANCE_M);
     }
 
@@ -373,7 +373,7 @@ mod tests {
         // ~1°S 81°E — Indian Ocean gravity low (global geoid minimum).
         // The geoid depression here reaches approximately −106 m (NIMA TR8350.2).
         // Threshold is conservative to account for spherical harmonic truncation error.
-        let n = geoid_undulation(-1.0, 81.0).expect("valid coordinates");
+        let n = geoid_undulation_egm96(-1.0, 81.0).expect("valid coordinates");
         assert!(
             n < -90.0,
             "Indian Ocean geoid low: expected < -90 m, got {n:.2} m"
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn undulation_indonesia_high() {
         // ~5°N 120°E — Indonesian gravity high. Published maximum ≈ +85 m.
-        let n = geoid_undulation(5.0, 120.0).expect("valid coordinates");
+        let n = geoid_undulation_egm96(5.0, 120.0).expect("valid coordinates");
         assert!(
             n > 50.0,
             "Indonesian geoid high: expected > +50 m, got {n:.2} m"
@@ -394,7 +394,7 @@ mod tests {
     fn undulation_conus_range() {
         // CONUS undulations range from about −10 m to −40 m.
         // Denver, CO (~39.7°N, 104.9°W) is representative.
-        let n = geoid_undulation(39.7, -104.9).expect("valid coordinates");
+        let n = geoid_undulation_egm96(39.7, -104.9).expect("valid coordinates");
         assert!(
             n > -50.0 && n < 0.0,
             "CONUS undulation: expected −50..0 m, got {n:.2} m"
@@ -417,22 +417,22 @@ mod tests {
 
     #[test]
     fn out_of_bounds_lat_rejected() {
-        assert!(geoid_undulation(91.0, 0.0).is_err());
-        assert!(geoid_undulation(-91.0, 0.0).is_err());
+        assert!(geoid_undulation_egm96(91.0, 0.0).is_err());
+        assert!(geoid_undulation_egm96(-91.0, 0.0).is_err());
     }
 
     #[test]
     fn non_finite_coords_rejected() {
-        assert!(geoid_undulation(f64::NAN, 0.0).is_err());
-        assert!(geoid_undulation(0.0, f64::INFINITY).is_err());
-        assert!(geoid_undulation(f64::NEG_INFINITY, 0.0).is_err());
+        assert!(geoid_undulation_egm96(f64::NAN, 0.0).is_err());
+        assert!(geoid_undulation_egm96(0.0, f64::INFINITY).is_err());
+        assert!(geoid_undulation_egm96(f64::NEG_INFINITY, 0.0).is_err());
     }
 
     #[test]
     fn lon_wrapping_consistent() {
         // 190°E wraps to −170°E — same meridian, same undulation.
-        let n1 = geoid_undulation(0.0, 190.0).expect("valid coordinates");
-        let n2 = geoid_undulation(0.0, -170.0).expect("valid coordinates");
+        let n1 = geoid_undulation_egm96(0.0, 190.0).expect("valid coordinates");
+        let n2 = geoid_undulation_egm96(0.0, -170.0).expect("valid coordinates");
         assert_abs_diff_eq!(n1, n2, epsilon = 1e-9);
     }
 
@@ -489,7 +489,7 @@ mod tests {
          */
         let points = [(0.0_f64, 0.0_f64), (47.5, -121.5)];
         for (lat, lon) in points {
-            let n96 = geoid_undulation(lat, lon).expect("egm96");
+            let n96 = geoid_undulation_egm96(lat, lon).expect("egm96");
             let n08 = geoid_undulation_egm2008(lat, lon).expect("egm2008");
             assert!(
                 (n96 - n08).abs() < 3.0,

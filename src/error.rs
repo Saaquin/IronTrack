@@ -18,6 +18,29 @@
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
+// Datum errors
+// ---------------------------------------------------------------------------
+
+/// Errors from altitude datum conversions (EGM2008 ↔ EGM96 ↔ WGS84 ↔ AGL).
+///
+/// The two variants wrap the underlying error types from the geoid and terrain
+/// subsystems so callers can distinguish between "the geoid model failed" and
+/// "the DEM tile was not available" without inspecting nested error chains.
+#[derive(Debug, Error)]
+pub enum DatumError {
+    /// An EGM2008 or EGM96 geoid undulation lookup failed (coordinate out of
+    /// bounds or non-finite input).
+    #[error("geoid undulation lookup failed: {0}")]
+    Geoid(#[from] GeodesyError),
+    /// A terrain elevation query failed during AGL ↔ ellipsoidal conversion.
+    /// Terrain access failures (tile not cached, ocean/void pixel) propagate
+    /// here unchanged so the caller can apply the same graceful fallbacks as
+    /// the rest of the terrain pipeline.
+    #[error("terrain elevation query failed during datum conversion: {0}")]
+    Terrain(#[from] DemError),
+}
+
+// ---------------------------------------------------------------------------
 // DEM errors
 // ---------------------------------------------------------------------------
 

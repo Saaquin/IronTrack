@@ -327,7 +327,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use super::*;
-    use crate::types::{GeoCoord, Hemisphere, UtmCoord};
+    use crate::types::{GeoCoord, Hemisphere};
 
     /*
      * Reference values from published tabulations and online UTM converters.

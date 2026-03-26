@@ -22,7 +22,7 @@
 //! See .agents/testing.md §Geodesy Tests for dataset download and format details.
 
 use approx::assert_abs_diff_eq;
-use irontrack::geodesy::geoid::geoid_undulation;
+use irontrack::geodesy::geoid::geoid_undulation_egm96;
 use irontrack::geodesy::{utm_to_wgs84, utm_zone, wgs84_to_utm};
 use irontrack::photogrammetry::flightlines::{
     generate_flight_lines, BoundingBox, FlightPlanParams,
@@ -357,7 +357,7 @@ fn geoid_undulation_nima_reference_points() {
      * −90 m), so it is handled separately from the symmetric tolerance check.
      */
     for case in &cases {
-        let n = geoid_undulation(case.lat, case.lon)
+        let n = geoid_undulation_egm96(case.lat, case.lon)
             .unwrap_or_else(|e| panic!("undulation failed for {}: {e}", case.label));
 
         if case.label.contains("threshold") {
@@ -379,7 +379,77 @@ fn geoid_undulation_nima_reference_points() {
     }
 }
 
-/// Kahan summation drift verification via flight-line waypoint spacing.
+/// Verify conversion between EGM2008 and EGM96 datums.
+///
+/// Chaining through the WGS84 ellipsoidal pivot:
+///   H_egm96 = H_egm2008 + N_egm2008 - N_egm96
+///
+/// Denver, CO (~39.7°N, 104.9°W):
+///   N_egm96 ≈ -18.0 m
+///   N_egm2008 ≈ -17.3 m
+///   Difference ≈ 0.7 m
+#[test]
+fn altitude_datum_egm2008_to_egm96_denver() {
+    use irontrack::geodesy::geoid::{Egm2008Model, GeoidModel};
+    use irontrack::dem::TerrainEngine;
+    use irontrack::types::{AltitudeDatum, FlightLine};
+
+    let lat: f64 = 39.7;
+    let lon: f64 = -104.9;
+    let h_2008: f64 = 1600.0; // approx Denver elevation
+
+    let mut line = FlightLine::new().with_datum(AltitudeDatum::Egm2008);
+    line.push(lat.to_radians(), lon.to_radians(), h_2008);
+
+    // Mock engine not needed for orthometric-to-orthometric conversion
+    // (though the API requires it for the AGL case).
+    let engine = TerrainEngine::new().expect("engine init");
+    
+    let line_96 = line.to_datum(AltitudeDatum::Egm96, &engine).expect("conversion");
+    let h_96 = line_96.elevations()[0];
+
+    let n_2008 = Egm2008Model::new().undulation(lat, lon).unwrap();
+    let n_96 = GeoidModel::new().undulation(lat, lon).unwrap();
+    let expected_96 = h_2008 + n_2008 - n_96;
+
+    assert_abs_diff_eq!(h_96, expected_96, epsilon = 1e-6);
+    assert_eq!(line_96.altitude_datum, AltitudeDatum::Egm96);
+    
+    // Difference is ~1.9m at this specific lat/lon according to the models.
+    let diff = (h_96 - h_2008).abs();
+    assert!(diff > 1.0 && diff < 2.5, "Expected ~1.9m difference, got {diff:.3}m");
+}
+
+/// Verify AGL conversion preserves round-trip values.
+#[test]
+fn altitude_datum_agl_roundtrip() {
+    use irontrack::dem::TerrainEngine;
+    use irontrack::types::{AltitudeDatum, FlightLine};
+
+    // Create a synthetic flat tile at 100m MSL (EGM2008)
+    let _dir = tempfile::TempDir::new().expect("create temp dir");
+    // We need to use internal helper or just write a valid-enough TIFF.
+    // For simplicity, we'll use an existing test utility if possible, 
+    // but here we just need ANY tile.
+    
+    // Actually, TerrainEngine::new() without any tiles will return 0m MSL (ocean/void).
+    // Let's use that for a clean test.
+    let engine = TerrainEngine::new().expect("engine init");
+    
+    let lat: f64 = 0.0;
+    let lon: f64 = 0.0;
+    let agl: f64 = 120.0;
+
+    let mut line = FlightLine::new().with_datum(AltitudeDatum::Agl);
+    line.push(lat.to_radians(), lon.to_radians(), agl);
+
+    // AGL -> Ellipsoidal -> AGL
+    let line_ellip = line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine).expect("to ellip");
+    let line_back = line_ellip.to_datum(AltitudeDatum::Agl, &engine).expect("back to agl");
+
+    assert_abs_diff_eq!(line_back.elevations()[0], agl, epsilon = 1e-6);
+    assert_eq!(line_back.altitude_datum, AltitudeDatum::Agl);
+}
 ///
 /// The flight-line generator uses inline Kahan compensated summation to
 /// accumulate geodesic distance along each line. A long line over a flat

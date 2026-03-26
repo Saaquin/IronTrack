@@ -17,6 +17,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{GeodesyError, PhotogrammetryError};
 
 /*
@@ -180,6 +182,55 @@ impl fmt::Display for UtmCoord {
 }
 
 // ---------------------------------------------------------------------------
+// Altitude datum
+// ---------------------------------------------------------------------------
+
+/// Vertical datum tag for altitude values stored in a `FlightLine`.
+///
+/// Every waypoint elevation is meaningless without knowing which reference
+/// surface it is measured from. This tag travels with the data so exporters
+/// and autopilot format writers can perform the correct conversion without
+/// assumptions.
+///
+/// Conversion between datums is performed by `datum::FlightLine::to_datum`,
+/// which chains through the WGS84 ellipsoidal pivot for all transformations.
+///
+/// Default is `Egm2008` because Copernicus GLO-30 — the primary DEM source —
+/// uses EGM2008 as its vertical datum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AltitudeDatum {
+    /// EGM2008 geoid (orthometric height, ≈MSL). Copernicus GLO-30 native datum.
+    #[default]
+    Egm2008,
+    /// EGM96 geoid (orthometric height, ≈MSL). SRTM native datum.
+    Egm96,
+    /// WGS84 ellipsoidal height (h = H + N). GNSS receiver native output.
+    Wgs84Ellipsoidal,
+    /// Above Ground Level. Aircraft height above the terrain directly below.
+    Agl,
+}
+
+impl AltitudeDatum {
+    /// Machine-readable string identifier used in GeoPackage descriptions and
+    /// GeoJSON properties. These strings are stable — do not change them once
+    /// data files exist in the wild.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AltitudeDatum::Egm2008 => "EGM2008",
+            AltitudeDatum::Egm96 => "EGM96",
+            AltitudeDatum::Wgs84Ellipsoidal => "WGS84_ELLIPSOIDAL",
+            AltitudeDatum::Agl => "AGL",
+        }
+    }
+}
+
+impl fmt::Display for AltitudeDatum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Flight line  (Structure-of-Arrays)
 // ---------------------------------------------------------------------------
 
@@ -195,11 +246,20 @@ pub struct FlightLine {
     lats: Vec<f64>,       // geodetic latitudes  (radians)
     lons: Vec<f64>,       // geodetic longitudes (radians)
     elevations: Vec<f64>, // terrain elevation above MSL (metres)
+    /// Vertical datum that the values in `elevations` are referenced to.
+    /// Always set this when constructing a `FlightLine` from a DEM pass.
+    pub altitude_datum: AltitudeDatum,
 }
 
 impl FlightLine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the altitude datum for this flight line.
+    pub fn with_datum(mut self, datum: AltitudeDatum) -> Self {
+        self.altitude_datum = datum;
+        self
     }
 
     /// Append one waypoint. All three components are written atomically,
@@ -629,5 +689,27 @@ mod tests {
     #[test]
     fn sensor_new_nan_focal_length_is_error() {
         assert!(SensorParams::new(f64::NAN, 13.2, 8.8, 5472, 3648).is_err());
+    }
+
+    // --- AltitudeDatum ------------------------------------------------------
+
+    #[test]
+    fn altitude_datum_default_is_egm2008() {
+        let d: AltitudeDatum = Default::default();
+        assert_eq!(d, AltitudeDatum::Egm2008);
+    }
+
+    #[test]
+    fn altitude_datum_as_str_values() {
+        assert_eq!(AltitudeDatum::Egm2008.as_str(), "EGM2008");
+        assert_eq!(AltitudeDatum::Egm96.as_str(), "EGM96");
+        assert_eq!(AltitudeDatum::Wgs84Ellipsoidal.as_str(), "WGS84_ELLIPSOIDAL");
+        assert_eq!(AltitudeDatum::Agl.as_str(), "AGL");
+    }
+
+    #[test]
+    fn flightline_default_datum_is_egm2008() {
+        let fl = FlightLine::default();
+        assert_eq!(fl.altitude_datum, AltitudeDatum::Egm2008);
     }
 }

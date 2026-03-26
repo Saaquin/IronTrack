@@ -29,7 +29,7 @@ use irontrack::photogrammetry::flightlines::{
     adjust_for_terrain, generate_flight_lines, validate_overlap, BoundingBox, FlightPlan,
     FlightPlanParams,
 };
-use irontrack::types::SensorParams;
+use irontrack::types::{AltitudeDatum, SensorParams};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -147,6 +147,11 @@ enum Commands {
         #[arg(long)]
         terrain: bool,
 
+        /// Target vertical datum for output altitudes. Choices: egm2008, egm96, ellipsoidal, agl.
+        /// Default is egm2008 (matches Copernicus DEM).
+        #[arg(long, default_value = "egm2008", value_name = "DATUM")]
+        datum: String,
+
         // --- Output ---------------------------------------------------------
         /// GeoPackage output file path.
         #[arg(long, value_name = "PATH")]
@@ -183,6 +188,7 @@ fn main() {
             azimuth,
             altitude_msl,
             terrain,
+            datum,
             output,
             geojson,
         }) => run_plan(PlanArgs {
@@ -202,6 +208,7 @@ fn main() {
             azimuth,
             altitude_msl,
             terrain,
+            datum,
             output,
             geojson,
         }),
@@ -292,11 +299,22 @@ struct PlanArgs {
     azimuth: f64,
     altitude_msl: Option<f64>,
     terrain: bool,
+    datum: String,
     output: PathBuf,
     geojson: Option<PathBuf>,
 }
 
 fn run_plan(args: PlanArgs) -> Result<()> {
+    // --- Resolve target datum ----------------------------------------------
+
+    let target_datum = match args.datum.to_lowercase().as_str() {
+        "egm2008" => AltitudeDatum::Egm2008,
+        "egm96" => AltitudeDatum::Egm96,
+        "ellipsoidal" | "wgs84" => AltitudeDatum::Wgs84Ellipsoidal,
+        "agl" => AltitudeDatum::Agl,
+        other => bail!("unknown datum {other:?}. Choose: egm2008, egm96, ellipsoidal, agl."),
+    };
+
     // --- Resolve sensor parameters -----------------------------------------
 
     let sensor_params = resolve_sensor(&args)?;
@@ -345,11 +363,27 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 
     // --- Terrain-aware validation and adjustment (optional) ----------------
 
-    let plan = if args.terrain {
+    let (mut plan, engine) = if args.terrain {
         apply_terrain_adjustment(plan, &params)?
     } else {
-        plan
+        (plan, None)
     };
+
+    // --- Convert to target vertical datum ----------------------------------
+
+    if plan.lines.first().map(|l| l.altitude_datum) != Some(target_datum) {
+        let engine = match engine {
+            Some(e) => e,
+            None => TerrainEngine::new().context("cannot initialise terrain engine for datum conversion")?,
+        };
+        
+        let mut converted_lines = Vec::with_capacity(plan.lines.len());
+        for line in &plan.lines {
+            converted_lines.push(line.to_datum(target_datum, &engine)?);
+        }
+        plan.lines = converted_lines;
+        println!("Altitude datum conversion: applied (target: {target_datum}).");
+    }
 
     // --- Export to GeoPackage ----------------------------------------------
 
@@ -383,7 +417,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 /// unchanged rather than failing the whole mission. This matches the
 /// "graceful degradation" principle — the user gets a plan even without
 /// cached tiles, and is clearly warned about the limitation.
-fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Result<FlightPlan> {
+fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Result<(FlightPlan, Option<TerrainEngine>)> {
     let terrain = TerrainEngine::new().context("cannot initialise terrain engine")?;
 
     /*
@@ -405,7 +439,7 @@ fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Res
         }
         Err(DemError::TileNotFound(msg)) => {
             eprintln!("[Warning] Terrain validation skipped — DEM tile not cached.\n  {msg}");
-            return Ok(plan);
+            return Ok((plan, Some(terrain)));
         }
         /*
          * NoData (ocean/void pixel) is not a hard error at the validation
@@ -417,7 +451,7 @@ fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Res
             eprintln!(
                 "[Warning] Terrain validation skipped — DEM returned no-data (ocean/void pixel)."
             );
-            return Ok(plan);
+            return Ok((plan, Some(terrain)));
         }
         Err(e) => return Err(anyhow::anyhow!(e).context("terrain validation failed")),
     }
@@ -429,17 +463,17 @@ fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Res
     match adjust_for_terrain(&plan, &terrain) {
         Ok(adjusted) => {
             println!("Terrain adjustment:  applied.");
-            Ok(adjusted)
+            Ok((adjusted, Some(terrain)))
         }
         Err(DemError::TileNotFound(msg)) => {
             eprintln!("[Warning] Terrain adjustment skipped — DEM tile not cached.\n  {msg}");
-            Ok(plan)
+            Ok((plan, Some(terrain)))
         }
         Err(DemError::NoData(_)) => {
             eprintln!(
                 "[Warning] Terrain adjustment skipped — DEM returned no-data (ocean/void pixel)."
             );
-            Ok(plan)
+            Ok((plan, Some(terrain)))
         }
         Err(e) => Err(anyhow::anyhow!(e).context("terrain adjustment failed")),
     }
@@ -490,8 +524,15 @@ fn print_summary(plan: &FlightPlan, params: &FlightPlanParams, gsd_cm: f64, sens
     println!("  Line spacing    : {line_spacing:.1} m");
     println!("  Photo interval  : {photo_interval:.1} m");
     println!();
+    let datum_str = plan
+        .lines
+        .first()
+        .map(|l| l.altitude_datum.as_str())
+        .unwrap_or("EGM2008");
+
     println!("  Est. distance   : {total_distance_km:.2} km");
     println!("  Est. flight time: {flight_time_min:.0} min  (@ {CRUISE_SPEED_MS:.0} m/s + {TURN_TIME_S:.0}s/turn)");
+    println!("  Altitude datum  : {datum_str}");
     println!("----------------------");
 }
 

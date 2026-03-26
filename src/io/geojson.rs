@@ -58,6 +58,18 @@ pub fn write_geojson(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
 /// FeatureCollection. Separated from `write_geojson` so callers can embed
 /// the collection in larger JSON documents or write to arbitrary writers.
 pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
+    /*
+     * Derive the datum tag from the first line. All lines in a plan are
+     * expected to share the same datum (they all come from the same DEM pass),
+     * so sampling the first is sufficient. Fall back to "EGM2008" for empty
+     * plans to keep the output valid.
+     */
+    let datum_str = plan
+        .lines
+        .first()
+        .map(|l| l.altitude_datum.as_str())
+        .unwrap_or("EGM2008");
+
     let features: Vec<Value> = plan
         .lines
         .iter()
@@ -95,6 +107,7 @@ pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
                 },
                 "properties": {
                     "line_index": idx,
+                    "altitude_datum": line.altitude_datum.as_str(),
                     "min_altitude_msl_m": min_alt,
                     "max_altitude_msl_m": max_alt,
                     "target_gsd_m": plan.params.target_gsd_m,
@@ -107,6 +120,7 @@ pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
 
     json!({
         "type": "FeatureCollection",
+        "altitude_datum": datum_str,
         "features": features
     })
 }

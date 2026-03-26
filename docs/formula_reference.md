@@ -163,9 +163,10 @@ Alpha coefficients (6th order, for forward projection):
 
 Forward transform (φ, λ → E, N):
 1. Compute conformal latitude χ from geodetic latitude φ
-2. Compute ξ' = asin(sin χ / cosh(cos χ × (λ - λ₀)))
-3. Compute η' = atanh(cos χ × sin(λ - λ₀) / √(sin²χ + cos²χ × cos²(λ - λ₀)))
-4. Apply series:
+2. Compute Gauss-Schreiber TM coordinates (ξ', η'):
+   ξ' = atan2(sin χ, cos χ × cos(λ - λ₀))
+   η' = atanh(cos χ × sin(λ - λ₀))
+3. Apply series:
 ```
    ξ = ξ' + Σ(j=1..6) α_j × sin(2j × ξ') × cosh(2j × η')
    η = η' + Σ(j=1..6) α_j × cos(2j × ξ') × sinh(2j × η')

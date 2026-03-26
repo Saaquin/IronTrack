@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn egm96_undulation_origin_spot_check() {
         use approx::assert_abs_diff_eq;
-        let n = super::geoid::geoid_undulation(0.0, 0.0).expect("valid coordinates");
+        let n = super::geoid::geoid_undulation_egm96(0.0, 0.0).expect("valid coordinates");
         assert_abs_diff_eq!(n, 17.16, epsilon = 1.5);
     }
 }

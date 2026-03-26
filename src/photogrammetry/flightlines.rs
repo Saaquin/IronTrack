@@ -37,7 +37,113 @@ use rayon::prelude::*;
 
 use crate::dem::TerrainEngine;
 use crate::error::{DemError, PhotogrammetryError};
-use crate::types::{FlightLine, SensorParams};
+use crate::geodesy::geoid::{Egm2008Model, GeoidModel};
+use crate::types::{AltitudeDatum, FlightLine, SensorParams};
+
+impl FlightLine {
+    /// Convert all altitudes in this flight line to a target vertical datum.
+    ///
+    /// Chaining through the WGS84 ellipsoidal pivot is the only safe path for
+    /// orthometric-to-orthometric transformations (e.g. EGM2008 → EGM96).
+    /// AGL conversions require access to the `TerrainEngine` to query surface
+    /// elevations at each waypoint.
+    ///
+    /// # Errors
+    /// Propagates `DemError` if AGL conversion is requested and a DEM tile
+    /// is missing or corrupt.
+    pub fn to_datum(
+        &self,
+        target: AltitudeDatum,
+        engine: &TerrainEngine,
+    ) -> Result<FlightLine, DemError> {
+        if self.altitude_datum == target {
+            return Ok(self.clone());
+        }
+
+        let egm96 = GeoidModel::new();
+        let egm2008 = Egm2008Model::new();
+
+        // Phase 1: Convert current elevations to WGS84 ellipsoidal (h).
+        let ellipsoidal_h: Vec<f64> = match self.altitude_datum {
+            AltitudeDatum::Wgs84Ellipsoidal => self.elevations().to_vec(),
+            AltitudeDatum::Egm2008 => self
+                .lats()
+                .iter()
+                .zip(self.lons().iter().zip(self.elevations().iter()))
+                .map(|(&la, (&lo, &h))| {
+                    let n = egm2008.undulation(la.to_degrees(), lo.to_degrees())?;
+                    Ok(h + n)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DemError::Geoid(e))?,
+            AltitudeDatum::Egm96 => self
+                .lats()
+                .iter()
+                .zip(self.lons().iter().zip(self.elevations().iter()))
+                .map(|(&la, (&lo, &h))| {
+                    let n = egm96.undulation(la.to_degrees(), lo.to_degrees())?;
+                    Ok(h + n)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DemError::Geoid(e))?,
+            AltitudeDatum::Agl => {
+                // To get ellipsoidal h from AGL, we need: h = terrain_ortho + N + AGL
+                self.lats()
+                    .iter()
+                    .zip(self.lons().iter().zip(self.elevations().iter()))
+                    .map(|(&la, (&lo, &agl))| {
+                        let report = engine.query(la.to_degrees(), lo.to_degrees())?;
+                        Ok::<f64, DemError>(report.ellipsoidal_m + agl)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        // Phase 2: Convert from WGS84 ellipsoidal (h) to target datum.
+        let final_elevations: Vec<f64> = match target {
+            AltitudeDatum::Wgs84Ellipsoidal => ellipsoidal_h,
+            AltitudeDatum::Egm2008 => self
+                .lats()
+                .iter()
+                .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
+                .map(|(&la, (&lo, &h))| {
+                    let n = egm2008.undulation(la.to_degrees(), lo.to_degrees())?;
+                    Ok(h - n)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DemError::Geoid(e))?,
+            AltitudeDatum::Egm96 => self
+                .lats()
+                .iter()
+                .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
+                .map(|(&la, (&lo, &h))| {
+                    let n = egm96.undulation(la.to_degrees(), lo.to_degrees())?;
+                    Ok(h - n)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DemError::Geoid(e))?,
+            AltitudeDatum::Agl => {
+                // AGL = h_aircraft - h_terrain_ellipsoidal
+                self.lats()
+                    .iter()
+                    .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
+                    .map(|(&la, (&lo, &h))| {
+                        let report = engine.query(la.to_degrees(), lo.to_degrees())?;
+                        Ok::<f64, DemError>(h - report.ellipsoidal_m)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+
+        let mut new_line = FlightLine::new().with_datum(target);
+        for i in 0..self.len() {
+            new_line.push(self.lats()[i], self.lons()[i], final_elevations[i]);
+        }
+
+        Ok(new_line)
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -301,9 +407,10 @@ pub fn generate_flight_lines(
      * For the flat-terrain case without an explicit MSL override, the terrain
      * is treated as 0 m MSL and the aircraft flies at nominal_agl above it.
      */
-    let flight_alt_m = params
-        .flight_altitude_msl
-        .unwrap_or_else(|| params.nominal_agl());
+    let (flight_alt_m, datum) = match params.flight_altitude_msl {
+        Some(msl) => (msl, AltitudeDatum::Egm2008),
+        None => (params.nominal_agl(), AltitudeDatum::Agl),
+    };
 
     // --- Decompose bbox corners into cross-track / along-track extents -----
 
@@ -403,7 +510,7 @@ pub fn generate_flight_lines(
              * waypoint is placed via an independent direct geodesic from the
              * line start, so errors do not compound across steps.
              */
-            let mut line = FlightLine::new();
+            let mut line = FlightLine::new().with_datum(datum);
             let mut kahan_sum = 0.0_f64;
             let mut kahan_c = 0.0_f64;
 
@@ -712,7 +819,7 @@ pub fn adjust_for_terrain(
     let mut flat_idx = 0_usize;
     for line in &plan.lines {
         let n = line.len();
-        let mut new_line = FlightLine::new();
+        let mut new_line = FlightLine::new().with_datum(AltitudeDatum::Egm2008);
         for i in 0..n {
             let (lat_rad, lon_rad, alt_m) = adjusted[flat_idx + i];
             new_line.push(lat_rad, lon_rad, alt_m);
