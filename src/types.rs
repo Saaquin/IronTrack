@@ -703,7 +703,10 @@ mod tests {
     fn altitude_datum_as_str_values() {
         assert_eq!(AltitudeDatum::Egm2008.as_str(), "EGM2008");
         assert_eq!(AltitudeDatum::Egm96.as_str(), "EGM96");
-        assert_eq!(AltitudeDatum::Wgs84Ellipsoidal.as_str(), "WGS84_ELLIPSOIDAL");
+        assert_eq!(
+            AltitudeDatum::Wgs84Ellipsoidal.as_str(),
+            "WGS84_ELLIPSOIDAL"
+        );
         assert_eq!(AltitudeDatum::Agl.as_str(), "AGL");
     }
 

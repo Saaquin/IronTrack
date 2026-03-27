@@ -164,7 +164,8 @@ fn parse_kml_polygons(xml: &[u8]) -> Result<Vec<Polygon>, IoError> {
                 }
             }
             Ok(Event::Text(ref e)) if in_coordinates => {
-                let text = e.unescape()
+                let text = e
+                    .unescape()
                     .map_err(|err| IoError::Serialization(format!("KML text error: {err}")))?;
                 parse_coordinate_text(&text, &mut current_ring)?;
             }
@@ -188,10 +189,7 @@ fn parse_kml_polygons(xml: &[u8]) -> Result<Vec<Polygon>, IoError> {
 /// KML spec: coordinates are longitude,latitude[,altitude] separated by
 /// whitespace. We store as (latitude, longitude) to match our internal
 /// convention.
-fn parse_coordinate_text(
-    text: &str,
-    ring: &mut Vec<(f64, f64)>,
-) -> Result<(), IoError> {
+fn parse_coordinate_text(text: &str, ring: &mut Vec<(f64, f64)>) -> Result<(), IoError> {
     for tuple in text.split_whitespace() {
         let parts: Vec<&str> = tuple.split(',').collect();
         if parts.len() < 2 {

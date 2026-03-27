@@ -77,8 +77,7 @@ pub fn write_dji_kmz(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
      */
     let file = std::fs::File::create(path)?;
     let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file("wpmz/template.kml", options)
         .map_err(|e| IoError::Serialization(format!("ZIP error: {e}")))?;
@@ -128,8 +127,12 @@ fn build_template_kml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
     let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
 
     // XML declaration
-    w.write_event(Event::Decl(quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None)))
-        .map_err(xml_err)?;
+    w.write_event(Event::Decl(quick_xml::events::BytesDecl::new(
+        "1.0",
+        Some("UTF-8"),
+        None,
+    )))
+    .map_err(xml_err)?;
 
     // <kml xmlns="..." xmlns:wpml="...">
     let mut kml = BytesStart::new("kml");
@@ -138,10 +141,12 @@ fn build_template_kml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
     w.write_event(Event::Start(kml)).map_err(xml_err)?;
 
     // <Document>
-    w.write_event(Event::Start(BytesStart::new("Document"))).map_err(xml_err)?;
+    w.write_event(Event::Start(BytesStart::new("Document")))
+        .map_err(xml_err)?;
 
     // <wpml:missionConfig>
-    w.write_event(Event::Start(BytesStart::new("wpml:missionConfig"))).map_err(xml_err)?;
+    w.write_event(Event::Start(BytesStart::new("wpml:missionConfig")))
+        .map_err(xml_err)?;
 
     write_text_element(&mut w, "wpml:flyToWaylineMode", "safely")?;
     write_text_element(&mut w, "wpml:finishAction", "goHome")?;
@@ -159,7 +164,8 @@ fn build_template_kml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
     write_text_element(&mut w, "wpml:executeHeightMode", "EGM96")?;
 
     // </wpml:missionConfig>
-    w.write_event(Event::End(BytesEnd::new("wpml:missionConfig"))).map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("wpml:missionConfig")))
+        .map_err(xml_err)?;
 
     /*
      * One Folder per flight line, containing Placemarks for visual reference
@@ -167,11 +173,14 @@ fn build_template_kml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
      * autopilot ignores it, but operators use it for pre-flight review.
      */
     for (line_idx, line) in plan.lines.iter().enumerate() {
-        w.write_event(Event::Start(BytesStart::new("Folder"))).map_err(xml_err)?;
+        w.write_event(Event::Start(BytesStart::new("Folder")))
+            .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:templateId", &line_idx.to_string())?;
 
-        w.write_event(Event::Start(BytesStart::new("wpml:waylineCoordinateSysParam")))
-            .map_err(xml_err)?;
+        w.write_event(Event::Start(BytesStart::new(
+            "wpml:waylineCoordinateSysParam",
+        )))
+        .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:coordinateMode", "WGS84")?;
         write_text_element(&mut w, "wpml:heightMode", "EGM96")?;
         w.write_event(Event::End(BytesEnd::new("wpml:waylineCoordinateSysParam")))
@@ -185,25 +194,32 @@ fn build_template_kml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             let lon_deg = lons[i].to_degrees();
             let alt = elevs[i];
 
-            w.write_event(Event::Start(BytesStart::new("Placemark"))).map_err(xml_err)?;
-            w.write_event(Event::Start(BytesStart::new("Point"))).map_err(xml_err)?;
+            w.write_event(Event::Start(BytesStart::new("Placemark")))
+                .map_err(xml_err)?;
+            w.write_event(Event::Start(BytesStart::new("Point")))
+                .map_err(xml_err)?;
             write_text_element(
                 &mut w,
                 "coordinates",
                 &format!("{lon_deg:.9},{lat_deg:.9},{alt:.3}"),
             )?;
-            w.write_event(Event::End(BytesEnd::new("Point"))).map_err(xml_err)?;
+            w.write_event(Event::End(BytesEnd::new("Point")))
+                .map_err(xml_err)?;
             write_text_element(&mut w, "wpml:index", &i.to_string())?;
-            w.write_event(Event::End(BytesEnd::new("Placemark"))).map_err(xml_err)?;
+            w.write_event(Event::End(BytesEnd::new("Placemark")))
+                .map_err(xml_err)?;
         }
 
-        w.write_event(Event::End(BytesEnd::new("Folder"))).map_err(xml_err)?;
+        w.write_event(Event::End(BytesEnd::new("Folder")))
+            .map_err(xml_err)?;
     }
 
     // </Document>
-    w.write_event(Event::End(BytesEnd::new("Document"))).map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("Document")))
+        .map_err(xml_err)?;
     // </kml>
-    w.write_event(Event::End(BytesEnd::new("kml"))).map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("kml")))
+        .map_err(xml_err)?;
 
     Ok(buf.into_inner())
 }
@@ -216,15 +232,20 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
     let mut buf = Cursor::new(Vec::new());
     let mut w = Writer::new_with_indent(&mut buf, b' ', 2);
 
-    w.write_event(Event::Decl(quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None)))
-        .map_err(xml_err)?;
+    w.write_event(Event::Decl(quick_xml::events::BytesDecl::new(
+        "1.0",
+        Some("UTF-8"),
+        None,
+    )))
+    .map_err(xml_err)?;
 
     let mut kml = BytesStart::new("kml");
     kml.push_attribute(("xmlns", KML_NS));
     kml.push_attribute(("xmlns:wpml", WPML_NS));
     w.write_event(Event::Start(kml)).map_err(xml_err)?;
 
-    w.write_event(Event::Start(BytesStart::new("Document"))).map_err(xml_err)?;
+    w.write_event(Event::Start(BytesStart::new("Document")))
+        .map_err(xml_err)?;
 
     /*
      * Global action group counter. DJI requires unique actionGroupId values
@@ -238,7 +259,8 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             continue;
         }
 
-        w.write_event(Event::Start(BytesStart::new("Folder"))).map_err(xml_err)?;
+        w.write_event(Event::Start(BytesStart::new("Folder")))
+            .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:templateId", &line_idx.to_string())?;
         write_text_element(&mut w, "wpml:executeHeightMode", "EGM96")?;
         write_text_element(&mut w, "wpml:waylineId", &line_idx.to_string())?;
@@ -257,15 +279,14 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             let lon_deg = lons[i].to_degrees();
             let alt = elevs[i];
 
-            w.write_event(Event::Start(BytesStart::new("Placemark"))).map_err(xml_err)?;
+            w.write_event(Event::Start(BytesStart::new("Placemark")))
+                .map_err(xml_err)?;
 
-            w.write_event(Event::Start(BytesStart::new("Point"))).map_err(xml_err)?;
-            write_text_element(
-                &mut w,
-                "coordinates",
-                &format!("{lon_deg:.9},{lat_deg:.9}"),
-            )?;
-            w.write_event(Event::End(BytesEnd::new("Point"))).map_err(xml_err)?;
+            w.write_event(Event::Start(BytesStart::new("Point")))
+                .map_err(xml_err)?;
+            write_text_element(&mut w, "coordinates", &format!("{lon_deg:.9},{lat_deg:.9}"))?;
+            w.write_event(Event::End(BytesEnd::new("Point")))
+                .map_err(xml_err)?;
 
             write_text_element(&mut w, "wpml:index", &i.to_string())?;
             write_text_element(&mut w, "wpml:executeHeight", &format!("{alt:.3}"))?;
@@ -290,7 +311,8 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             w.write_event(Event::End(BytesEnd::new("wpml:waypointTurnParam")))
                 .map_err(xml_err)?;
 
-            w.write_event(Event::End(BytesEnd::new("Placemark"))).map_err(xml_err)?;
+            w.write_event(Event::End(BytesEnd::new("Placemark")))
+                .map_err(xml_err)?;
         }
 
         /*
@@ -303,11 +325,7 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:actionGroupId", &action_group_id.to_string())?;
         write_text_element(&mut w, "wpml:actionGroupStartIndex", "0")?;
-        write_text_element(
-            &mut w,
-            "wpml:actionGroupEndIndex",
-            &(n - 1).to_string(),
-        )?;
+        write_text_element(&mut w, "wpml:actionGroupEndIndex", &(n - 1).to_string())?;
         write_text_element(&mut w, "wpml:actionGroupMode", "sequence")?;
 
         // Trigger condition
@@ -322,8 +340,10 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
             .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:actionId", "0")?;
         write_text_element(&mut w, "wpml:actionActuatorFunc", "takePhoto")?;
-        w.write_event(Event::Start(BytesStart::new("wpml:actionActuatorFuncParam")))
-            .map_err(xml_err)?;
+        w.write_event(Event::Start(BytesStart::new(
+            "wpml:actionActuatorFuncParam",
+        )))
+        .map_err(xml_err)?;
         write_text_element(&mut w, "wpml:payloadPositionIndex", "0")?;
         w.write_event(Event::End(BytesEnd::new("wpml:actionActuatorFuncParam")))
             .map_err(xml_err)?;
@@ -335,11 +355,14 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
 
         action_group_id += 1;
 
-        w.write_event(Event::End(BytesEnd::new("Folder"))).map_err(xml_err)?;
+        w.write_event(Event::End(BytesEnd::new("Folder")))
+            .map_err(xml_err)?;
     }
 
-    w.write_event(Event::End(BytesEnd::new("Document"))).map_err(xml_err)?;
-    w.write_event(Event::End(BytesEnd::new("kml"))).map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("Document")))
+        .map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new("kml")))
+        .map_err(xml_err)?;
 
     Ok(buf.into_inner())
 }
@@ -350,9 +373,12 @@ fn write_text_element(
     tag: &str,
     text: &str,
 ) -> Result<(), IoError> {
-    w.write_event(Event::Start(BytesStart::new(tag))).map_err(xml_err)?;
-    w.write_event(Event::Text(BytesText::new(text))).map_err(xml_err)?;
-    w.write_event(Event::End(BytesEnd::new(tag))).map_err(xml_err)?;
+    w.write_event(Event::Start(BytesStart::new(tag)))
+        .map_err(xml_err)?;
+    w.write_event(Event::Text(BytesText::new(text)))
+        .map_err(xml_err)?;
+    w.write_event(Event::End(BytesEnd::new(tag)))
+        .map_err(xml_err)?;
     Ok(())
 }
 
@@ -445,7 +471,10 @@ mod tests {
         let archive = zip::ZipArchive::new(file).unwrap();
         let names: Vec<&str> = archive.file_names().collect();
         assert!(names.contains(&"wpmz/template.kml"), "missing template.kml");
-        assert!(names.contains(&"wpmz/waylines.wpml"), "missing waylines.wpml");
+        assert!(
+            names.contains(&"wpmz/waylines.wpml"),
+            "missing waylines.wpml"
+        );
     }
 
     #[test]
@@ -556,7 +585,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.kmz");
         let result = write_dji_kmz(&path, &plan);
-        assert!(result.is_err(), "EGM2008 plan must be rejected for DJI export");
+        assert!(
+            result.is_err(),
+            "EGM2008 plan must be rejected for DJI export"
+        );
     }
 
     #[test]
@@ -587,7 +619,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.kmz");
         let result = write_dji_kmz(&path, &plan);
-        assert!(result.is_err(), "WGS84 plan must be rejected for DJI export");
+        assert!(
+            result.is_err(),
+            "WGS84 plan must be rejected for DJI export"
+        );
     }
 
     #[test]

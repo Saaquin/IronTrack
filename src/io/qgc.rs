@@ -90,8 +90,8 @@ pub fn write_qgc_plan(
 ) -> Result<(), IoError> {
     validate_datum(plan)?;
     let plan_json = flight_plan_to_qgc(plan, trigger_distance_m);
-    let json_bytes = serde_json::to_vec_pretty(&plan_json)
-        .map_err(|e| IoError::Serialization(e.to_string()))?;
+    let json_bytes =
+        serde_json::to_vec_pretty(&plan_json).map_err(|e| IoError::Serialization(e.to_string()))?;
     let mut file = std::fs::File::create(path)?;
     file.write_all(&json_bytes)?;
     Ok(())
@@ -120,9 +120,7 @@ fn validate_datum(plan: &FlightPlan) -> Result<(), IoError> {
      * altitudes would be misinterpreted by the autopilot, causing the
      * aircraft to fly at the wrong height — a flight-safety issue.
      */
-    if first_datum != AltitudeDatum::Agl
-        && first_datum != AltitudeDatum::Wgs84Ellipsoidal
-    {
+    if first_datum != AltitudeDatum::Agl && first_datum != AltitudeDatum::Wgs84Ellipsoidal {
         return Err(IoError::Serialization(format!(
             "QGC export requires WGS84 ellipsoidal or AGL altitudes, but plan uses {}. \
              Convert with FlightLine::to_datum() before export.",
@@ -384,19 +382,11 @@ mod tests {
             trigger_dist,
             epsilon = 1e-9
         );
-        assert_abs_diff_eq!(
-            start["params"][2].as_f64().unwrap(),
-            1.0,
-            epsilon = 1e-9
-        );
+        assert_abs_diff_eq!(start["params"][2].as_f64().unwrap(), 1.0, epsilon = 1e-9);
 
         let stop = items.last().unwrap();
         assert_eq!(stop["command"], MAV_CMD_DO_SET_CAM_TRIGG_DIST as u64);
-        assert_abs_diff_eq!(
-            stop["params"][0].as_f64().unwrap(),
-            0.0,
-            epsilon = 1e-9
-        );
+        assert_abs_diff_eq!(stop["params"][0].as_f64().unwrap(), 0.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -465,8 +455,7 @@ mod tests {
 
         let wp = &items[1];
         assert_eq!(
-            wp["frame"],
-            MAV_FRAME_GLOBAL_RELATIVE_ALT as u64,
+            wp["frame"], MAV_FRAME_GLOBAL_RELATIVE_ALT as u64,
             "AGL datum must use MAV_FRAME_GLOBAL_RELATIVE_ALT"
         );
     }
@@ -578,7 +567,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("bad.plan");
         let result = write_qgc_plan(&path, &plan, 25.0);
-        assert!(result.is_err(), "EGM2008 plan must be rejected for QGC export");
+        assert!(
+            result.is_err(),
+            "EGM2008 plan must be rejected for QGC export"
+        );
     }
 
     #[test]
@@ -614,6 +606,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mixed.plan");
         let result = write_qgc_plan(&path, &plan, 25.0);
-        assert!(result.is_err(), "mixed-datum plan must be rejected for QGC export");
+        assert!(
+            result.is_err(),
+            "mixed-datum plan must be rejected for QGC export"
+        );
     }
 }

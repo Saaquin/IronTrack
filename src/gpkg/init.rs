@@ -477,10 +477,7 @@ impl GeoPackage {
                 .unwrap_or(AltitudeDatum::Egm2008.as_str());
             self.conn.execute(
                 "UPDATE gpkg_contents SET description=?1 WHERE table_name=?2",
-                params![
-                    format!("altitude_datum={datum_str}"),
-                    table_name
-                ],
+                params![format!("altitude_datum={datum_str}"), table_name],
             )?;
 
             Ok::<(), GpkgError>(())

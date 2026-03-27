@@ -136,12 +136,7 @@ mod tests {
 
     /// Simple unit square: (0,0), (0,1), (1,1), (1,0).
     fn unit_square() -> Polygon {
-        Polygon::new(vec![
-            (0.0, 0.0),
-            (0.0, 1.0),
-            (1.0, 1.0),
-            (1.0, 0.0),
-        ])
+        Polygon::new(vec![(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
     }
 
     #[test]
@@ -200,18 +195,8 @@ mod tests {
          * Point (5,5) is in the hole — should be OUTSIDE.
          * Point (1,1) is between outer and hole — should be INSIDE.
          */
-        let outer = vec![
-            (0.0, 0.0),
-            (0.0, 10.0),
-            (10.0, 10.0),
-            (10.0, 0.0),
-        ];
-        let hole = vec![
-            (3.0, 3.0),
-            (3.0, 7.0),
-            (7.0, 7.0),
-            (7.0, 3.0),
-        ];
+        let outer = vec![(0.0, 0.0), (0.0, 10.0), (10.0, 10.0), (10.0, 0.0)];
+        let hole = vec![(3.0, 3.0), (3.0, 7.0), (7.0, 7.0), (7.0, 3.0)];
         let poly = Polygon::with_holes(outer, vec![hole]);
         assert!(poly.contains(1.0, 1.0), "between outer and hole");
         assert!(!poly.contains(5.0, 5.0), "inside hole");
@@ -220,12 +205,7 @@ mod tests {
 
     #[test]
     fn bbox_computed_correctly() {
-        let poly = Polygon::new(vec![
-            (51.5, -0.1),
-            (51.5, 0.0),
-            (51.6, 0.0),
-            (51.6, -0.1),
-        ]);
+        let poly = Polygon::new(vec![(51.5, -0.1), (51.5, 0.0), (51.6, 0.0), (51.6, -0.1)]);
         let (min_lat, min_lon, max_lat, max_lon) = poly.bbox();
         assert!((min_lat - 51.5).abs() < 1e-9);
         assert!((min_lon - (-0.1)).abs() < 1e-9);
@@ -241,11 +221,7 @@ mod tests {
 
     #[test]
     fn triangle_interior() {
-        let tri = Polygon::new(vec![
-            (0.0, 0.0),
-            (0.0, 4.0),
-            (3.0, 2.0),
-        ]);
+        let tri = Polygon::new(vec![(0.0, 0.0), (0.0, 4.0), (3.0, 2.0)]);
         assert!(tri.contains(1.0, 2.0));
         assert!(!tri.contains(0.0, 5.0));
     }

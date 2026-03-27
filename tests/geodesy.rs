@@ -72,11 +72,10 @@ fn utm_round_trip_all_zones() {
         let coord = GeoCoord::from_degrees(0.0, cm_lon, 0.0)
             .unwrap_or_else(|e| panic!("zone {zone} CM coord invalid: {e}"));
 
-        let utm = wgs84_to_utm(coord)
-            .unwrap_or_else(|e| panic!("zone {zone} forward failed: {e}"));
+        let utm = wgs84_to_utm(coord).unwrap_or_else(|e| panic!("zone {zone} forward failed: {e}"));
 
-        let (lat_back, lon_back) = utm_to_wgs84(&utm)
-            .unwrap_or_else(|e| panic!("zone {zone} inverse failed: {e}"));
+        let (lat_back, lon_back) =
+            utm_to_wgs84(&utm).unwrap_or_else(|e| panic!("zone {zone} inverse failed: {e}"));
 
         assert_abs_diff_eq!(lat_back, 0.0, epsilon = TOL_DEG);
         assert_abs_diff_eq!(lon_back, cm_lon, epsilon = TOL_DEG);
@@ -101,11 +100,10 @@ fn utm_round_trip_all_zones() {
         let coord = GeoCoord::from_degrees(lat, lon, 0.0)
             .unwrap_or_else(|e| panic!("{label}: coord invalid: {e}"));
 
-        let utm = wgs84_to_utm(coord)
-            .unwrap_or_else(|e| panic!("{label}: forward failed: {e}"));
+        let utm = wgs84_to_utm(coord).unwrap_or_else(|e| panic!("{label}: forward failed: {e}"));
 
-        let (lat_back, lon_back) = utm_to_wgs84(&utm)
-            .unwrap_or_else(|e| panic!("{label}: inverse failed: {e}"));
+        let (lat_back, lon_back) =
+            utm_to_wgs84(&utm).unwrap_or_else(|e| panic!("{label}: inverse failed: {e}"));
 
         assert_abs_diff_eq!(lat_back, lat, epsilon = TOL_DEG,);
         assert_abs_diff_eq!(lon_back, lon, epsilon = TOL_DEG,);
@@ -234,19 +232,11 @@ fn utm_spot_checks_absolute() {
         let coord = GeoCoord::from_degrees(case.lat, case.lon, 0.0)
             .unwrap_or_else(|e| panic!("{}: coord invalid: {e}", case.label));
 
-        let utm = wgs84_to_utm(coord)
-            .unwrap_or_else(|e| panic!("{}: forward failed: {e}", case.label));
+        let utm =
+            wgs84_to_utm(coord).unwrap_or_else(|e| panic!("{}: forward failed: {e}", case.label));
 
-        assert_abs_diff_eq!(
-            utm.easting,
-            case.expected_e,
-            epsilon = TOL_M,
-        );
-        assert_abs_diff_eq!(
-            utm.northing,
-            case.expected_n,
-            epsilon = TOL_M,
-        );
+        assert_abs_diff_eq!(utm.easting, case.expected_e, epsilon = TOL_M,);
+        assert_abs_diff_eq!(utm.northing, case.expected_n, epsilon = TOL_M,);
     }
 }
 
@@ -390,8 +380,8 @@ fn geoid_undulation_nima_reference_points() {
 ///   Difference ≈ 0.7 m
 #[test]
 fn altitude_datum_egm2008_to_egm96_denver() {
-    use irontrack::geodesy::geoid::{Egm2008Model, GeoidModel};
     use irontrack::dem::TerrainEngine;
+    use irontrack::geodesy::geoid::{Egm2008Model, GeoidModel};
     use irontrack::types::{AltitudeDatum, FlightLine};
 
     let lat: f64 = 39.7;
@@ -404,8 +394,10 @@ fn altitude_datum_egm2008_to_egm96_denver() {
     // Mock engine not needed for orthometric-to-orthometric conversion
     // (though the API requires it for the AGL case).
     let engine = TerrainEngine::new().expect("engine init");
-    
-    let line_96 = line.to_datum(AltitudeDatum::Egm96, &engine).expect("conversion");
+
+    let line_96 = line
+        .to_datum(AltitudeDatum::Egm96, &engine)
+        .expect("conversion");
     let h_96 = line_96.elevations()[0];
 
     let n_2008 = Egm2008Model::new().undulation(lat, lon).unwrap();
@@ -414,10 +406,13 @@ fn altitude_datum_egm2008_to_egm96_denver() {
 
     assert_abs_diff_eq!(h_96, expected_96, epsilon = 1e-6);
     assert_eq!(line_96.altitude_datum, AltitudeDatum::Egm96);
-    
+
     // Difference is ~1.9m at this specific lat/lon according to the models.
     let diff = (h_96 - h_2008).abs();
-    assert!(diff > 1.0 && diff < 2.5, "Expected ~1.9m difference, got {diff:.3}m");
+    assert!(
+        diff > 1.0 && diff < 2.5,
+        "Expected ~1.9m difference, got {diff:.3}m"
+    );
 }
 
 /// Verify AGL conversion preserves round-trip values.
@@ -429,13 +424,13 @@ fn altitude_datum_agl_roundtrip() {
     // Create a synthetic flat tile at 100m MSL (EGM2008)
     let _dir = tempfile::TempDir::new().expect("create temp dir");
     // We need to use internal helper or just write a valid-enough TIFF.
-    // For simplicity, we'll use an existing test utility if possible, 
+    // For simplicity, we'll use an existing test utility if possible,
     // but here we just need ANY tile.
-    
+
     // Actually, TerrainEngine::new() without any tiles will return 0m MSL (ocean/void).
     // Let's use that for a clean test.
     let engine = TerrainEngine::new().expect("engine init");
-    
+
     let lat: f64 = 0.0;
     let lon: f64 = 0.0;
     let agl: f64 = 120.0;
@@ -444,8 +439,12 @@ fn altitude_datum_agl_roundtrip() {
     line.push(lat.to_radians(), lon.to_radians(), agl);
 
     // AGL -> Ellipsoidal -> AGL
-    let line_ellip = line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine).expect("to ellip");
-    let line_back = line_ellip.to_datum(AltitudeDatum::Agl, &engine).expect("back to agl");
+    let line_ellip = line
+        .to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+        .expect("to ellip");
+    let line_back = line_ellip
+        .to_datum(AltitudeDatum::Agl, &engine)
+        .expect("back to agl");
 
     assert_abs_diff_eq!(line_back.elevations()[0], agl, epsilon = 1e-6);
     assert_eq!(line_back.altitude_datum, AltitudeDatum::Agl);

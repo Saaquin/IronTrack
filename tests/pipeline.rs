@@ -26,11 +26,11 @@
 
 use irontrack::gpkg::GeoPackage;
 use irontrack::io::{write_dji_kmz, write_geojson, write_qgc_plan};
-use std::io::Read;
 use irontrack::photogrammetry::flightlines::{
     generate_flight_lines, BoundingBox, FlightPlan, FlightPlanParams,
 };
 use irontrack::types::{AltitudeDatum, SensorParams};
+use std::io::Read;
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -453,17 +453,13 @@ fn dji_kmz_contains_egm96_altitudes_and_valid_structure() {
         "waylines must declare EGM96 height mode"
     );
     let wayline_count = waylines.matches("<wpml:waylineId>").count();
-    assert_eq!(
-        wayline_count, n_lines,
-        "one wayline per flight line"
-    );
+    assert_eq!(wayline_count, n_lines, "one wayline per flight line");
 
     // Verify camera trigger action groups
-    let action_count = waylines.matches("<wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>").count();
-    assert_eq!(
-        action_count, n_lines,
-        "one actionGroup per flight line"
-    );
+    let action_count = waylines
+        .matches("<wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>")
+        .count();
+    assert_eq!(action_count, n_lines, "one actionGroup per flight line");
     assert!(
         waylines.contains("<wpml:actionActuatorFunc>takePhoto</wpml:actionActuatorFunc>"),
         "action must be takePhoto"

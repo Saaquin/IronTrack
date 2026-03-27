@@ -65,8 +65,7 @@ pub fn copernicus_attribution_default() -> String {
 /// Disclaimer string identifying the Copernicus DEM license and access terms.
 ///
 /// Accompanies the attribution in all derived output artefacts.
-pub const COPERNICUS_DISCLAIMER: &str =
-    "The Copernicus DEM is provided under the Copernicus \
+pub const COPERNICUS_DISCLAIMER: &str = "The Copernicus DEM is provided under the Copernicus \
      Data Space Ecosystem License. See \
      https://dataspace.copernicus.eu/terms-and-conditions";
 
@@ -147,10 +146,7 @@ mod tests {
             attr.contains("2021"),
             "default attribution must contain year 2021, got: {attr}"
         );
-        assert!(
-            !attr.contains("{year}"),
-            "placeholder must be substituted"
-        );
+        assert!(!attr.contains("{year}"), "placeholder must be substituted");
     }
 
     #[test]

@@ -144,8 +144,14 @@ fn full_pipeline_all_exports() {
      * Verify waypoint altitudes are present (WGS84 ellipsoidal via frame 0).
      */
     let items = qgc["mission"]["items"].as_array().unwrap();
-    let wp = items.iter().find(|i| i["command"].as_u64() == Some(16)).unwrap();
-    assert_eq!(wp["frame"], 0, "WGS84 ellipsoidal must use MAV_FRAME_GLOBAL");
+    let wp = items
+        .iter()
+        .find(|i| i["command"].as_u64() == Some(16))
+        .unwrap();
+    assert_eq!(
+        wp["frame"], 0,
+        "WGS84 ellipsoidal must use MAV_FRAME_GLOBAL"
+    );
 
     // --- DJI .kmz ----------------------------------------------------------
 
@@ -203,7 +209,9 @@ fn datum_round_trip_egm2008_ellipsoidal_egm96_and_back() {
     let original_elevs: Vec<f64> = line.elevations().to_vec();
 
     // EGM2008 → WGS84 Ellipsoidal
-    let line_e = line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine).unwrap();
+    let line_e = line
+        .to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+        .unwrap();
     assert_eq!(line_e.altitude_datum, AltitudeDatum::Wgs84Ellipsoidal);
 
     /*
@@ -222,18 +230,16 @@ fn datum_round_trip_egm2008_ellipsoidal_egm96_and_back() {
     assert_eq!(line_96.altitude_datum, AltitudeDatum::Egm96);
 
     // EGM96 → WGS84 Ellipsoidal
-    let line_e2 = line_96.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine).unwrap();
+    let line_e2 = line_96
+        .to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+        .unwrap();
 
     // WGS84 Ellipsoidal → EGM2008
     let line_back = line_e2.to_datum(AltitudeDatum::Egm2008, &engine).unwrap();
     assert_eq!(line_back.altitude_datum, AltitudeDatum::Egm2008);
 
     for (i, &elev) in line_back.elevations().iter().enumerate() {
-        assert_abs_diff_eq!(
-            elev,
-            original_elevs[i],
-            epsilon = 0.001,
-        );
+        assert_abs_diff_eq!(elev, original_elevs[i], epsilon = 0.001,);
     }
 }
 
@@ -390,10 +396,7 @@ fn geopackage_metadata_fields_present() {
     gpkg.upsert_metadata("copernicus_disclaimer", "test disclaimer")
         .unwrap();
 
-    assert_eq!(
-        gpkg.query_metadata("schema_version").unwrap().unwrap(),
-        "2"
-    );
+    assert_eq!(gpkg.query_metadata("schema_version").unwrap().unwrap(), "2");
     assert_eq!(
         gpkg.query_metadata("safety_dsm_warning").unwrap().unwrap(),
         "test warning"

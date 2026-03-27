@@ -403,7 +403,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
      * (the defaults are all 0.0 which would produce a degenerate box).
      */
     if boundary_polygons.is_none()
-        && (args.min_lat == 0.0 && args.max_lat == 0.0 && args.min_lon == 0.0 && args.max_lon == 0.0)
+        && (args.min_lat == 0.0
+            && args.max_lat == 0.0
+            && args.min_lon == 0.0
+            && args.max_lon == 0.0)
     {
         bail!(
             "either --boundary or all of --min-lat/--max-lat/--min-lon/--max-lon must be provided"
@@ -419,7 +422,12 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             max_lat = max_lat.max(c);
             max_lon = max_lon.max(d);
         }
-        BoundingBox { min_lat, min_lon, max_lat, max_lon }
+        BoundingBox {
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        }
     } else {
         BoundingBox {
             min_lat: args.min_lat,
@@ -438,9 +446,15 @@ fn run_plan(args: PlanArgs) -> Result<()> {
          * LiDAR mission: line spacing from swath overlap, not GSD.
          * Require --lidar-prr, --lidar-scan-rate, --lidar-fov.
          */
-        let prr = args.lidar_prr.context("--lidar-prr is required for LiDAR missions")?;
-        let scan_rate = args.lidar_scan_rate.context("--lidar-scan-rate is required for LiDAR missions")?;
-        let fov = args.lidar_fov.context("--lidar-fov is required for LiDAR missions")?;
+        let prr = args
+            .lidar_prr
+            .context("--lidar-prr is required for LiDAR missions")?;
+        let scan_rate = args
+            .lidar_scan_rate
+            .context("--lidar-scan-rate is required for LiDAR missions")?;
+        let fov = args
+            .lidar_fov
+            .context("--lidar-fov is required for LiDAR missions")?;
 
         let sensor = LidarSensorParams::new(prr, scan_rate, fov, 0.0)
             .context("invalid LiDAR sensor parameters")?;
@@ -588,7 +602,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
      */
     let agl_datum_conversion_uses_dem = plan.lines.iter().any(|l| l.altitude_datum != target_datum)
         && (target_datum == AltitudeDatum::Agl
-            || plan.lines.iter().any(|l| l.altitude_datum == AltitudeDatum::Agl));
+            || plan
+                .lines
+                .iter()
+                .any(|l| l.altitude_datum == AltitudeDatum::Agl));
 
     let dsm_warning: Option<&str> = if engine
         .as_ref()
@@ -605,7 +622,8 @@ fn run_plan(args: PlanArgs) -> Result<()> {
     if plan.lines.iter().any(|l| l.altitude_datum != target_datum) {
         let engine = match engine {
             Some(e) => e,
-            None => TerrainEngine::new().context("cannot initialise terrain engine for datum conversion")?,
+            None => TerrainEngine::new()
+                .context("cannot initialise terrain engine for datum conversion")?,
         };
 
         let mut converted_lines = Vec::with_capacity(plan.lines.len());
@@ -674,8 +692,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
      */
     if let Some(qgc_path) = &args.qgc_plan {
         if is_lidar {
-            bail!("--qgc-plan is not supported for LiDAR missions. \
-                   QGC camera trigger commands do not apply to LiDAR sensors.");
+            bail!(
+                "--qgc-plan is not supported for LiDAR missions. \
+                   QGC camera trigger commands do not apply to LiDAR sensors."
+            );
         }
         let trigger_dist = params.photo_interval();
         let qgc_datum = plan
@@ -724,7 +744,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             .first()
             .map(|l| l.altitude_datum.as_str())
             .unwrap_or("N/A");
-        println!("QGC plan written:   {} (datum: {exported_datum})", qgc_path.display());
+        println!(
+            "QGC plan written:   {} (datum: {exported_datum})",
+            qgc_path.display()
+        );
     }
 
     // --- Export to DJI .kmz (optional) ------------------------------------
@@ -736,8 +759,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
      */
     if let Some(dji_path) = &args.dji_kmz {
         if is_lidar {
-            bail!("--dji-kmz is not supported for LiDAR missions. \
-                   DJI takePhoto actions do not apply to LiDAR sensors.");
+            bail!(
+                "--dji-kmz is not supported for LiDAR missions. \
+                   DJI takePhoto actions do not apply to LiDAR sensors."
+            );
         }
         let dji_datum = plan
             .lines
@@ -806,7 +831,10 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 /// unchanged rather than failing the whole mission. This matches the
 /// "graceful degradation" principle — the user gets a plan even without
 /// cached tiles, and is clearly warned about the limitation.
-fn apply_terrain_adjustment(plan: FlightPlan, _params: &FlightPlanParams) -> Result<(FlightPlan, Option<TerrainEngine>)> {
+fn apply_terrain_adjustment(
+    plan: FlightPlan,
+    _params: &FlightPlanParams,
+) -> Result<(FlightPlan, Option<TerrainEngine>)> {
     let terrain = TerrainEngine::new().context("cannot initialise terrain engine")?;
 
     /*

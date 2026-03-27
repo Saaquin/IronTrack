@@ -43,7 +43,6 @@ use crate::types::{AltitudeDatum, FlightLine, SensorParams};
 // Note: FlightLine::to_datum implementation lives in src/datum.rs
 // to keep this module focused on flight line generation.
 
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -372,7 +371,14 @@ pub fn generate_flight_lines(
         None => (params.nominal_agl(), AltitudeDatum::Agl),
     };
 
-    let lines = generate_grid(bbox, azimuth_deg, spacing, photo_interval, flight_alt_m, datum)?;
+    let lines = generate_grid(
+        bbox,
+        azimuth_deg,
+        spacing,
+        photo_interval,
+        flight_alt_m,
+        datum,
+    )?;
 
     Ok(FlightPlan {
         params: params.clone(),
@@ -413,7 +419,14 @@ pub fn generate_lidar_flight_lines(
         None => (params.agl_m, AltitudeDatum::Agl),
     };
 
-    let lines = generate_grid(bbox, azimuth_deg, spacing, waypoint_interval, flight_alt_m, datum)?;
+    let lines = generate_grid(
+        bbox,
+        azimuth_deg,
+        spacing,
+        waypoint_interval,
+        flight_alt_m,
+        datum,
+    )?;
 
     /*
      * Build a synthetic FlightPlanParams that produces the same spacing
@@ -467,7 +480,8 @@ fn generate_grid(
             bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon,
         )));
     }
-    if bbox.min_lat < -90.0 || bbox.max_lat > 90.0 || bbox.min_lon < -180.0 || bbox.max_lon > 180.0 {
+    if bbox.min_lat < -90.0 || bbox.max_lat > 90.0 || bbox.min_lon < -180.0 || bbox.max_lon > 180.0
+    {
         return Err(PhotogrammetryError::InvalidInput(format!(
             "bbox coordinates outside WGS84 bounds: lat [{:.4},{:.4}], lon [{:.4},{:.4}]",
             bbox.min_lat, bbox.max_lat, bbox.min_lon, bbox.max_lon,
@@ -508,10 +522,14 @@ fn generate_grid(
 
     // --- Grid dimensions ---------------------------------------------------
 
-    let n_lines = if cross_span < 1e-9 { 1_usize } else {
+    let n_lines = if cross_span < 1e-9 {
+        1_usize
+    } else {
         (cross_span / spacing).ceil() as usize + 1
     };
-    let n_waypoints = if along_span < 1e-9 { 1_usize } else {
+    let n_waypoints = if along_span < 1e-9 {
+        1_usize
+    } else {
         (along_span / waypoint_interval).ceil() as usize + 1
     };
 
@@ -554,7 +572,11 @@ fn generate_grid(
 /// Normalize azimuth to [0, 360).
 fn normalize_azimuth(deg: f64) -> f64 {
     let a = deg % 360.0;
-    if a < 0.0 { a + 360.0 } else { a }
+    if a < 0.0 {
+        a + 360.0
+    } else {
+        a
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,9 +631,8 @@ pub fn clip_to_polygon(plan: FlightPlan, polygon: &crate::math::geometry::Polygo
                     /*
                      * Both inside — append to current segment.
                      */
-                    let seg = current_segment.get_or_insert_with(|| {
-                        FlightLine::new().with_datum(datum)
-                    });
+                    let seg =
+                        current_segment.get_or_insert_with(|| FlightLine::new().with_datum(datum));
                     seg.push(lats[i], lons[i], elevs[i]);
                 }
                 (true, false) => {
@@ -621,8 +642,12 @@ pub fn clip_to_polygon(plan: FlightPlan, polygon: &crate::math::geometry::Polygo
                      * segment's last point, then emit the segment.
                      */
                     let (b_lat, b_lon, b_elev) = bisect_boundary(
-                        lats[i - 1], lons[i - 1], elevs[i - 1],
-                        lats[i], lons[i], elevs[i],
+                        lats[i - 1],
+                        lons[i - 1],
+                        elevs[i - 1],
+                        lats[i],
+                        lons[i],
+                        elevs[i],
                         polygon,
                     );
                     if let Some(ref mut seg) = current_segment {
@@ -641,8 +666,12 @@ pub fn clip_to_polygon(plan: FlightPlan, polygon: &crate::math::geometry::Polygo
                      * segment with the crossing point and the current waypoint.
                      */
                     let (b_lat, b_lon, b_elev) = bisect_boundary(
-                        lats[i - 1], lons[i - 1], elevs[i - 1],
-                        lats[i], lons[i], elevs[i],
+                        lats[i - 1],
+                        lons[i - 1],
+                        elevs[i - 1],
+                        lats[i],
+                        lons[i],
+                        elevs[i],
                         polygon,
                     );
                     let mut seg = FlightLine::new().with_datum(datum);
@@ -684,8 +713,12 @@ pub fn clip_to_polygon(plan: FlightPlan, polygon: &crate::math::geometry::Polygo
 /// 20 iterations of bisection on a ~100 m waypoint interval yields
 /// sub-millimetre precision (100 / 2^20 < 0.0001 m).
 fn bisect_boundary(
-    lat_a: f64, lon_a: f64, elev_a: f64,
-    lat_b: f64, lon_b: f64, elev_b: f64,
+    lat_a: f64,
+    lon_a: f64,
+    elev_a: f64,
+    lat_b: f64,
+    lon_b: f64,
+    elev_b: f64,
     polygon: &crate::math::geometry::Polygon,
 ) -> (f64, f64, f64) {
     let mut a_lat = lat_a;
@@ -1634,8 +1667,14 @@ mod tests {
         };
         let params = lidar_params();
         let plan = generate_lidar_flight_lines(&bbox, 0.0, &params).unwrap();
-        assert!(plan.lines.len() >= 15, "LiDAR plan must generate sufficient lines");
-        assert!(plan.lines.len() <= 30, "LiDAR line count should be reasonable");
+        assert!(
+            plan.lines.len() >= 15,
+            "LiDAR plan must generate sufficient lines"
+        );
+        assert!(
+            plan.lines.len() <= 30,
+            "LiDAR line count should be reasonable"
+        );
     }
 
     #[test]
@@ -1653,8 +1692,14 @@ mod tests {
         let params = lidar_params();
         let plan = generate_lidar_flight_lines(&bbox, 0.0, &params).unwrap();
         let wp_per_line = plan.lines[0].len();
-        assert!(wp_per_line >= 15, "waypoint count per line (got {wp_per_line})");
-        assert!(wp_per_line <= 35, "waypoint count per line (got {wp_per_line})");
+        assert!(
+            wp_per_line >= 15,
+            "waypoint count per line (got {wp_per_line})"
+        );
+        assert!(
+            wp_per_line <= 35,
+            "waypoint count per line (got {wp_per_line})"
+        );
     }
 
     #[test]
@@ -1671,7 +1716,10 @@ mod tests {
          * At 100 m interval, roughly half as many waypoints as at 50 m.
          */
         let wp = plan.lines[0].len();
-        assert!(wp >= 8 && wp <= 18, "waypoint count at 100m interval (got {wp})");
+        assert!(
+            wp >= 8 && wp <= 18,
+            "waypoint count at 100m interval (got {wp})"
+        );
     }
 
     #[test]
@@ -1827,10 +1875,8 @@ mod tests {
             for i in 0..line.len() {
                 let lat_deg = line.lats()[i].to_degrees();
                 let lon_deg = line.lons()[i].to_degrees();
-                let in_hole = lat_deg > 51.503
-                    && lat_deg < 51.507
-                    && lon_deg > -0.094
-                    && lon_deg < -0.086;
+                let in_hole =
+                    lat_deg > 51.503 && lat_deg < 51.507 && lon_deg > -0.094 && lon_deg < -0.086;
                 assert!(
                     !in_hole,
                     "waypoint at ({lat_deg:.6}, {lon_deg:.6}) should not be inside the hole"
