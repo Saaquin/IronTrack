@@ -37,112 +37,11 @@ use rayon::prelude::*;
 
 use crate::dem::TerrainEngine;
 use crate::error::{DemError, PhotogrammetryError};
-use crate::geodesy::geoid::{Egm2008Model, GeoidModel};
+use crate::photogrammetry::lidar::{self, LidarSensorParams};
 use crate::types::{AltitudeDatum, FlightLine, SensorParams};
 
-impl FlightLine {
-    /// Convert all altitudes in this flight line to a target vertical datum.
-    ///
-    /// Chaining through the WGS84 ellipsoidal pivot is the only safe path for
-    /// orthometric-to-orthometric transformations (e.g. EGM2008 → EGM96).
-    /// AGL conversions require access to the `TerrainEngine` to query surface
-    /// elevations at each waypoint.
-    ///
-    /// # Errors
-    /// Propagates `DemError` if AGL conversion is requested and a DEM tile
-    /// is missing or corrupt.
-    pub fn to_datum(
-        &self,
-        target: AltitudeDatum,
-        engine: &TerrainEngine,
-    ) -> Result<FlightLine, DemError> {
-        if self.altitude_datum == target {
-            return Ok(self.clone());
-        }
-
-        let egm96 = GeoidModel::new();
-        let egm2008 = Egm2008Model::new();
-
-        // Phase 1: Convert current elevations to WGS84 ellipsoidal (h).
-        let ellipsoidal_h: Vec<f64> = match self.altitude_datum {
-            AltitudeDatum::Wgs84Ellipsoidal => self.elevations().to_vec(),
-            AltitudeDatum::Egm2008 => self
-                .lats()
-                .iter()
-                .zip(self.lons().iter().zip(self.elevations().iter()))
-                .map(|(&la, (&lo, &h))| {
-                    let n = egm2008.undulation(la.to_degrees(), lo.to_degrees())?;
-                    Ok(h + n)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DemError::Geoid(e))?,
-            AltitudeDatum::Egm96 => self
-                .lats()
-                .iter()
-                .zip(self.lons().iter().zip(self.elevations().iter()))
-                .map(|(&la, (&lo, &h))| {
-                    let n = egm96.undulation(la.to_degrees(), lo.to_degrees())?;
-                    Ok(h + n)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DemError::Geoid(e))?,
-            AltitudeDatum::Agl => {
-                // To get ellipsoidal h from AGL, we need: h = terrain_ortho + N + AGL
-                self.lats()
-                    .iter()
-                    .zip(self.lons().iter().zip(self.elevations().iter()))
-                    .map(|(&la, (&lo, &agl))| {
-                        let report = engine.query(la.to_degrees(), lo.to_degrees())?;
-                        Ok::<f64, DemError>(report.ellipsoidal_m + agl)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-        };
-
-        // Phase 2: Convert from WGS84 ellipsoidal (h) to target datum.
-        let final_elevations: Vec<f64> = match target {
-            AltitudeDatum::Wgs84Ellipsoidal => ellipsoidal_h,
-            AltitudeDatum::Egm2008 => self
-                .lats()
-                .iter()
-                .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
-                .map(|(&la, (&lo, &h))| {
-                    let n = egm2008.undulation(la.to_degrees(), lo.to_degrees())?;
-                    Ok(h - n)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DemError::Geoid(e))?,
-            AltitudeDatum::Egm96 => self
-                .lats()
-                .iter()
-                .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
-                .map(|(&la, (&lo, &h))| {
-                    let n = egm96.undulation(la.to_degrees(), lo.to_degrees())?;
-                    Ok(h - n)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| DemError::Geoid(e))?,
-            AltitudeDatum::Agl => {
-                // AGL = h_aircraft - h_terrain_ellipsoidal
-                self.lats()
-                    .iter()
-                    .zip(self.lons().iter().zip(ellipsoidal_h.iter()))
-                    .map(|(&la, (&lo, &h))| {
-                        let report = engine.query(la.to_degrees(), lo.to_degrees())?;
-                        Ok::<f64, DemError>(h - report.ellipsoidal_m)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-        };
-
-        let mut new_line = FlightLine::new().with_datum(target);
-        for i in 0..self.len() {
-            new_line.push(self.lats()[i], self.lons()[i], final_elevations[i]);
-        }
-
-        Ok(new_line)
-    }
-}
+// Note: FlightLine::to_datum implementation lives in src/datum.rs
+// to keep this module focused on flight line generation.
 
 
 // ---------------------------------------------------------------------------
@@ -294,6 +193,111 @@ impl FlightPlanParams {
 }
 
 // ---------------------------------------------------------------------------
+// LiDAR plan parameters
+// ---------------------------------------------------------------------------
+
+/// Parameters for a LiDAR survey mission.
+///
+/// LiDAR line spacing is driven by swath overlap, not GSD. Point density
+/// is the primary quality metric. Waypoint interval is a navigation parameter
+/// — the LiDAR fires continuously, so waypoints simply define the aircraft
+/// trajectory resolution.
+#[derive(Clone)]
+pub struct LidarPlanParams {
+    /// LiDAR sensor head parameters.
+    pub sensor: LidarSensorParams,
+    /// Planned AGL in metres.
+    pub agl_m: f64,
+    /// Aircraft ground speed in m/s.
+    pub ground_speed_ms: f64,
+    /// Lateral (cross-track) swath overlap, percent. Default: 50.0.
+    pub side_lap_percent: f64,
+    /// Along-track waypoint spacing in metres. Default: 50.0.
+    /// This defines trajectory resolution, not trigger interval.
+    pub waypoint_interval_m: f64,
+    /// Planned MSL flight altitude (see FlightPlanParams::flight_altitude_msl).
+    pub flight_altitude_msl: Option<f64>,
+}
+
+impl LidarPlanParams {
+    /// Construct with default side-lap (50%) and waypoint interval (50 m).
+    pub fn new(
+        sensor: LidarSensorParams,
+        agl_m: f64,
+        ground_speed_ms: f64,
+    ) -> Result<Self, PhotogrammetryError> {
+        if !agl_m.is_finite() || agl_m <= 0.0 {
+            return Err(PhotogrammetryError::InvalidInput(format!(
+                "agl_m must be positive and finite, got {agl_m}"
+            )));
+        }
+        if !ground_speed_ms.is_finite() || ground_speed_ms <= 0.0 {
+            return Err(PhotogrammetryError::InvalidInput(format!(
+                "ground_speed_ms must be positive and finite, got {ground_speed_ms}"
+            )));
+        }
+        Ok(Self {
+            sensor,
+            agl_m,
+            ground_speed_ms,
+            side_lap_percent: 50.0,
+            waypoint_interval_m: 50.0,
+            flight_altitude_msl: None,
+        })
+    }
+
+    /// Builder: set lateral overlap percent.
+    pub fn with_side_lap(mut self, pct: f64) -> Result<Self, PhotogrammetryError> {
+        if !pct.is_finite() || !(0.0..100.0).contains(&pct) {
+            return Err(PhotogrammetryError::InvalidOverlap(pct));
+        }
+        self.side_lap_percent = pct;
+        Ok(self)
+    }
+
+    /// Builder: set waypoint interval.
+    pub fn with_waypoint_interval(mut self, interval_m: f64) -> Result<Self, PhotogrammetryError> {
+        if !interval_m.is_finite() || interval_m <= 0.0 {
+            return Err(PhotogrammetryError::InvalidInput(format!(
+                "waypoint_interval_m must be positive and finite, got {interval_m}"
+            )));
+        }
+        self.waypoint_interval_m = interval_m;
+        Ok(self)
+    }
+
+    /// Nominal AGL for this mission.
+    pub fn nominal_agl(&self) -> f64 {
+        self.agl_m
+    }
+
+    /// Cross-track spacing between adjacent flight lines (metres).
+    ///
+    /// spacing = swath_width(AGL, FOV) × (1 - side_lap / 100)
+    pub fn flight_line_spacing(&self) -> f64 {
+        lidar::swath_width(self.agl_m, self.sensor.fov_deg) * (1.0 - self.side_lap_percent / 100.0)
+    }
+
+    /// Along-track waypoint interval (metres). For LiDAR this is a
+    /// navigation parameter, not a trigger interval.
+    pub fn waypoint_interval(&self) -> f64 {
+        self.waypoint_interval_m
+    }
+
+    /// Predicted point density at the planned AGL and speed.
+    pub fn point_density(&self) -> Result<f64, PhotogrammetryError> {
+        lidar::point_density(&self.sensor, self.agl_m, self.ground_speed_ms)
+    }
+}
+
+/// Mission type discriminant for flight plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissionType {
+    Camera,
+    Lidar,
+}
+
+// ---------------------------------------------------------------------------
 // FlightPlan — contract between the photogrammetry engine and the I/O layer
 // ---------------------------------------------------------------------------
 
@@ -353,6 +357,104 @@ pub fn generate_flight_lines(
     azimuth_deg: f64,
     params: &FlightPlanParams,
 ) -> Result<FlightPlan, PhotogrammetryError> {
+    let spacing = params.flight_line_spacing();
+    let photo_interval = params.photo_interval();
+
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return Err(PhotogrammetryError::InvalidOverlap(params.side_lap_percent));
+    }
+    if !photo_interval.is_finite() || photo_interval <= 0.0 {
+        return Err(PhotogrammetryError::InvalidOverlap(params.end_lap_percent));
+    }
+
+    let (flight_alt_m, datum) = match params.flight_altitude_msl {
+        Some(msl) => (msl, AltitudeDatum::Egm2008),
+        None => (params.nominal_agl(), AltitudeDatum::Agl),
+    };
+
+    let lines = generate_grid(bbox, azimuth_deg, spacing, photo_interval, flight_alt_m, datum)?;
+
+    Ok(FlightPlan {
+        params: params.clone(),
+        azimuth_deg: normalize_azimuth(azimuth_deg),
+        lines,
+    })
+}
+
+/// Generate a grid of parallel LiDAR survey lines covering `bbox`.
+///
+/// Uses the same Karney geodesic grid algorithm as [`generate_flight_lines`],
+/// but derives line spacing from the LiDAR swath overlap formula instead of
+/// GSD-based photogrammetric spacing.
+///
+/// Returns a [`FlightPlan`] with a synthetic `FlightPlanParams` that preserves
+/// the LiDAR spacing values for downstream exporters. The `FlightPlan` itself
+/// is interchangeable with camera plans for GeoPackage / GeoJSON / autopilot
+/// export.
+pub fn generate_lidar_flight_lines(
+    bbox: &BoundingBox,
+    azimuth_deg: f64,
+    params: &LidarPlanParams,
+) -> Result<FlightPlan, PhotogrammetryError> {
+    let spacing = params.flight_line_spacing();
+    let waypoint_interval = params.waypoint_interval();
+
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return Err(PhotogrammetryError::InvalidOverlap(params.side_lap_percent));
+    }
+    if !waypoint_interval.is_finite() || waypoint_interval <= 0.0 {
+        return Err(PhotogrammetryError::InvalidInput(
+            "waypoint interval must be positive".into(),
+        ));
+    }
+
+    let (flight_alt_m, datum) = match params.flight_altitude_msl {
+        Some(msl) => (msl, AltitudeDatum::Egm2008),
+        None => (params.agl_m, AltitudeDatum::Agl),
+    };
+
+    let lines = generate_grid(bbox, azimuth_deg, spacing, waypoint_interval, flight_alt_m, datum)?;
+
+    /*
+     * Build a synthetic FlightPlanParams that produces the same spacing
+     * values as the LiDAR params. This allows FlightPlan to be used with
+     * existing exporters (GeoJSON, GeoPackage, QGC, DJI) without changes.
+     * The sensor fields carry the LiDAR FOV-derived swath, not camera GSD.
+     */
+    let synthetic_params = FlightPlanParams {
+        sensor: SensorParams {
+            focal_length_mm: 1.0,
+            sensor_width_mm: 1.0,
+            sensor_height_mm: 1.0,
+            image_width_px: 1,
+            image_height_px: 1,
+        },
+        target_gsd_m: 0.0,
+        side_lap_percent: params.side_lap_percent,
+        end_lap_percent: 0.0,
+        flight_altitude_msl: params.flight_altitude_msl,
+    };
+
+    Ok(FlightPlan {
+        params: synthetic_params,
+        azimuth_deg: normalize_azimuth(azimuth_deg),
+        lines,
+    })
+}
+
+/// Shared grid generation core.
+///
+/// Decomposes the bounding box into cross-track / along-track extents
+/// using Karney geodesic inverse, then generates a parallel grid of
+/// waypoints with Kahan compensated summation.
+fn generate_grid(
+    bbox: &BoundingBox,
+    azimuth_deg: f64,
+    spacing: f64,
+    waypoint_interval: f64,
+    flight_alt_m: f64,
+    datum: AltitudeDatum,
+) -> Result<Vec<FlightLine>, PhotogrammetryError> {
     // --- Input validation --------------------------------------------------
 
     let coords_ok = bbox.min_lat.is_finite()
@@ -365,13 +467,7 @@ pub fn generate_flight_lines(
             bbox.min_lat, bbox.min_lon, bbox.max_lat, bbox.max_lon,
         )));
     }
-    /*
-     * Reject coordinates outside the WGS84 domain before they reach the
-     * Karney solver. This matches the invariant enforced by GeoCoord and
-     * TerrainEngine elsewhere in the codebase.
-     */
-    if bbox.min_lat < -90.0 || bbox.max_lat > 90.0 || bbox.min_lon < -180.0 || bbox.max_lon > 180.0
-    {
+    if bbox.min_lat < -90.0 || bbox.max_lat > 90.0 || bbox.min_lon < -180.0 || bbox.max_lon > 180.0 {
         return Err(PhotogrammetryError::InvalidInput(format!(
             "bbox coordinates outside WGS84 bounds: lat [{:.4},{:.4}], lon [{:.4},{:.4}]",
             bbox.min_lat, bbox.max_lat, bbox.min_lon, bbox.max_lon,
@@ -382,50 +478,11 @@ pub fn generate_flight_lines(
             "azimuth_deg must be finite".into(),
         ));
     }
-    // Normalise to [0, 360) for consistent cross_azi computation and tracing.
-    let azimuth_deg = {
-        let a = azimuth_deg % 360.0;
-        if a < 0.0 {
-            a + 360.0
-        } else {
-            a
-        }
-    };
 
-    let spacing = params.flight_line_spacing();
-    let photo_interval = params.photo_interval();
+    let azimuth_deg = normalize_azimuth(azimuth_deg);
 
-    if !spacing.is_finite() || spacing <= 0.0 {
-        return Err(PhotogrammetryError::InvalidOverlap(params.side_lap_percent));
-    }
-    if !photo_interval.is_finite() || photo_interval <= 0.0 {
-        return Err(PhotogrammetryError::InvalidOverlap(params.end_lap_percent));
-    }
+    // --- Decompose bbox corners -------------------------------------------
 
-    /*
-     * MSL altitude stored in each waypoint's elevation slot.
-     * For the flat-terrain case without an explicit MSL override, the terrain
-     * is treated as 0 m MSL and the aircraft flies at nominal_agl above it.
-     */
-    let (flight_alt_m, datum) = match params.flight_altitude_msl {
-        Some(msl) => (msl, AltitudeDatum::Egm2008),
-        None => (params.nominal_agl(), AltitudeDatum::Agl),
-    };
-
-    // --- Decompose bbox corners into cross-track / along-track extents -----
-
-    /*
-     * For each corner we compute the signed projection onto the cross-track
-     * and along-track axes using the planar approximation:
-     *
-     *   delta = normalize(azi_to_corner − flight_azi)  [in radians]
-     *   cross = s12 × sin(delta)   (positive = right of flight)
-     *   along = s12 × cos(delta)   (positive = ahead of flight)
-     *
-     * s12 and azi_to_corner come from the Karney inverse geodesic — the most
-     * accurate available (~15 nm) and free of the convergence failures that
-     * make Vincenty unsafe in Rayon (CLAUDE.md).
-     */
     let geod = Geodesic::wgs84();
     let (center_lat, center_lon) = bbox.center();
 
@@ -435,7 +492,6 @@ pub fn generate_flight_lines(
     let mut along_max = f64::NEG_INFINITY;
 
     for (c_lat, c_lon) in bbox.corners() {
-        // 4-tuple inverse → (s12, azi1, azi2, a12)
         let (s12, azi_to, _azi2, _a12): (f64, f64, f64, f64) =
             geod.inverse(center_lat, center_lon, c_lat, c_lon);
         let delta_rad = normalize_delta(azi_to - azimuth_deg).to_radians();
@@ -447,69 +503,31 @@ pub fn generate_flight_lines(
         along_max = along_max.max(along);
     }
 
-    let cross_span = cross_max - cross_min; // metres, always >= 0
-    let along_span = along_max - along_min; // metres, always >= 0
+    let cross_span = cross_max - cross_min;
+    let along_span = along_max - along_min;
 
     // --- Grid dimensions ---------------------------------------------------
 
-    /*
-     * Number of lines: lines are positioned at cross_min, cross_min+spacing,
-     * …, cross_min+(n−1)×spacing. The last line must reach or exceed cross_max
-     * to guarantee coverage at the right edge:
-     *   (n−1) × spacing ≥ cross_span  →  n = ⌈cross_span / spacing⌉ + 1
-     *
-     * For a degenerate (zero-width) cross-span, a single centre line suffices.
-     */
-    let n_lines = if cross_span < 1e-9 {
-        1_usize
-    } else {
+    let n_lines = if cross_span < 1e-9 { 1_usize } else {
         (cross_span / spacing).ceil() as usize + 1
     };
-
-    /*
-     * Waypoints per line: same logic — step from 0 to along_span in
-     * photo_interval steps, always including an endpoint.
-     */
-    let n_waypoints = if along_span < 1e-9 {
-        1_usize
-    } else {
-        (along_span / photo_interval).ceil() as usize + 1
+    let n_waypoints = if along_span < 1e-9 { 1_usize } else {
+        (along_span / waypoint_interval).ceil() as usize + 1
     };
 
-    // Cross-track direction is 90° clockwise from the flight azimuth.
     let cross_azi = azimuth_deg + 90.0;
 
     // --- Generate lines (parallel via Rayon) --------------------------------
 
-    /*
-     * Each closure is self-contained: it holds a copy of the Geodesic
-     * (which is Copy) and all scalar parameters. No shared mutable state.
-     */
     let lines: Vec<FlightLine> = (0..n_lines)
         .into_par_iter()
         .map(|i| {
-            // Cross-track offset of this line from the box centre (metres).
             let cross_offset = cross_min + i as f64 * spacing;
-
-            // Origin on the cross-track axis.
             let (orig_lat, orig_lon): (f64, f64) =
                 geod.direct(center_lat, center_lon, cross_azi, cross_offset);
-
-            /*
-             * First waypoint: step `along_min` from origin along the flight
-             * direction. along_min is negative for a symmetric box (the far
-             * edge is "behind" the centre), so geod.direct receives a negative
-             * s12 and correctly steps in the reverse direction.
-             */
             let (start_lat, start_lon): (f64, f64) =
                 geod.direct(orig_lat, orig_lon, azimuth_deg, along_min);
 
-            /*
-             * Step waypoints forward using Kahan compensated summation to
-             * prevent floating-point drift over long flight lines. Each
-             * waypoint is placed via an independent direct geodesic from the
-             * line start, so errors do not compound across steps.
-             */
             let mut line = FlightLine::new().with_datum(datum);
             let mut kahan_sum = 0.0_f64;
             let mut kahan_c = 0.0_f64;
@@ -517,13 +535,9 @@ pub fn generate_flight_lines(
             for j in 0..n_waypoints {
                 let (wp_lat, wp_lon): (f64, f64) =
                     geod.direct(start_lat, start_lon, azimuth_deg, kahan_sum);
-
-                // FlightLine stores geodetic coordinates in radians.
                 line.push(wp_lat.to_radians(), wp_lon.to_radians(), flight_alt_m);
-
-                // Advance the Kahan accumulator (skip on the last iteration).
                 if j + 1 < n_waypoints {
-                    let y = photo_interval - kahan_c;
+                    let y = waypoint_interval - kahan_c;
                     let t = kahan_sum + y;
                     kahan_c = (t - kahan_sum) - y;
                     kahan_sum = t;
@@ -534,11 +548,185 @@ pub fn generate_flight_lines(
         })
         .collect();
 
-    Ok(FlightPlan {
-        params: params.clone(),
-        azimuth_deg,
-        lines,
-    })
+    Ok(lines)
+}
+
+/// Normalize azimuth to [0, 360).
+fn normalize_azimuth(deg: f64) -> f64 {
+    let a = deg % 360.0;
+    if a < 0.0 { a + 360.0 } else { a }
+}
+
+// ---------------------------------------------------------------------------
+// Polygon boundary clipping (Phase 4I)
+// ---------------------------------------------------------------------------
+
+/// Clip a flight plan's lines to a polygon boundary.
+///
+/// Walks each line's waypoints and retains only segments where consecutive
+/// waypoints lie inside the polygon. When a line crosses the boundary, it
+/// is split into multiple sub-lines — one for each inside segment. This
+/// prevents the aircraft from flying over excluded areas (holes, concave
+/// notches, or outside the survey boundary entirely).
+///
+/// Returns a new `FlightPlan` with the clipped lines. Empty segments
+/// (all waypoints outside) are dropped.
+pub fn clip_to_polygon(plan: FlightPlan, polygon: &crate::math::geometry::Polygon) -> FlightPlan {
+    let mut clipped_lines: Vec<FlightLine> = Vec::new();
+
+    for line in &plan.lines {
+        let lats = line.lats();
+        let lons = line.lons();
+        let elevs = line.elevations();
+        let datum = line.altitude_datum;
+        let n = line.len();
+        if n == 0 {
+            continue;
+        }
+
+        /*
+         * Walk the waypoints and collect contiguous "inside" segments.
+         * When consecutive waypoints transition inside<->outside, a
+         * boundary crossing point is computed via bisection and inserted
+         * as an edge waypoint. This ensures coverage extends to the
+         * actual polygon boundary rather than being truncated inward by
+         * up to one waypoint interval.
+         */
+        let mut current_segment: Option<FlightLine> = None;
+        let mut prev_inside = polygon.contains(lats[0].to_degrees(), lons[0].to_degrees());
+
+        if prev_inside {
+            let mut seg = FlightLine::new().with_datum(datum);
+            seg.push(lats[0], lons[0], elevs[0]);
+            current_segment = Some(seg);
+        }
+
+        for i in 1..n {
+            let cur_inside = polygon.contains(lats[i].to_degrees(), lons[i].to_degrees());
+
+            match (prev_inside, cur_inside) {
+                (true, true) => {
+                    /*
+                     * Both inside — append to current segment.
+                     */
+                    let seg = current_segment.get_or_insert_with(|| {
+                        FlightLine::new().with_datum(datum)
+                    });
+                    seg.push(lats[i], lons[i], elevs[i]);
+                }
+                (true, false) => {
+                    /*
+                     * Exiting the polygon. Find the boundary crossing between
+                     * waypoint i-1 (inside) and i (outside), add it as the
+                     * segment's last point, then emit the segment.
+                     */
+                    let (b_lat, b_lon, b_elev) = bisect_boundary(
+                        lats[i - 1], lons[i - 1], elevs[i - 1],
+                        lats[i], lons[i], elevs[i],
+                        polygon,
+                    );
+                    if let Some(ref mut seg) = current_segment {
+                        seg.push(b_lat, b_lon, b_elev);
+                    }
+                    if let Some(seg) = current_segment.take() {
+                        if seg.len() >= 2 {
+                            clipped_lines.push(seg);
+                        }
+                    }
+                }
+                (false, true) => {
+                    /*
+                     * Entering the polygon. Find the boundary crossing between
+                     * waypoint i-1 (outside) and i (inside), start a new
+                     * segment with the crossing point and the current waypoint.
+                     */
+                    let (b_lat, b_lon, b_elev) = bisect_boundary(
+                        lats[i - 1], lons[i - 1], elevs[i - 1],
+                        lats[i], lons[i], elevs[i],
+                        polygon,
+                    );
+                    let mut seg = FlightLine::new().with_datum(datum);
+                    seg.push(b_lat, b_lon, b_elev);
+                    seg.push(lats[i], lons[i], elevs[i]);
+                    current_segment = Some(seg);
+                }
+                (false, false) => {
+                    /*
+                     * Both outside — skip. (A segment that crosses the polygon
+                     * twice between two waypoints is not handled; this requires
+                     * waypoint spacing << polygon feature size, which is the
+                     * normal case for survey flight plans.)
+                     */
+                }
+            }
+
+            prev_inside = cur_inside;
+        }
+
+        if let Some(seg) = current_segment.take() {
+            if seg.len() >= 2 {
+                clipped_lines.push(seg);
+            }
+        }
+    }
+
+    FlightPlan {
+        params: plan.params,
+        azimuth_deg: plan.azimuth_deg,
+        lines: clipped_lines,
+    }
+}
+
+/// Find the approximate polygon boundary crossing between two waypoints
+/// using bisection. One point must be inside the polygon and the other
+/// outside. Returns (lat_rad, lon_rad, elev) of the crossing point.
+///
+/// 20 iterations of bisection on a ~100 m waypoint interval yields
+/// sub-millimetre precision (100 / 2^20 < 0.0001 m).
+fn bisect_boundary(
+    lat_a: f64, lon_a: f64, elev_a: f64,
+    lat_b: f64, lon_b: f64, elev_b: f64,
+    polygon: &crate::math::geometry::Polygon,
+) -> (f64, f64, f64) {
+    let mut a_lat = lat_a;
+    let mut a_lon = lon_a;
+    let mut a_elev = elev_a;
+    let mut b_lat = lat_b;
+    let mut b_lon = lon_b;
+    let mut b_elev = elev_b;
+
+    /*
+     * Determine which end is inside. We always keep `a` as the inside
+     * point and `b` as the outside point.
+     */
+    let a_inside = polygon.contains(a_lat.to_degrees(), a_lon.to_degrees());
+    if !a_inside {
+        std::mem::swap(&mut a_lat, &mut b_lat);
+        std::mem::swap(&mut a_lon, &mut b_lon);
+        std::mem::swap(&mut a_elev, &mut b_elev);
+    }
+
+    for _ in 0..20 {
+        let mid_lat = (a_lat + b_lat) * 0.5;
+        let mid_lon = (a_lon + b_lon) * 0.5;
+        let mid_elev = (a_elev + b_elev) * 0.5;
+
+        if polygon.contains(mid_lat.to_degrees(), mid_lon.to_degrees()) {
+            a_lat = mid_lat;
+            a_lon = mid_lon;
+            a_elev = mid_elev;
+        } else {
+            b_lat = mid_lat;
+            b_lon = mid_lon;
+            b_elev = mid_elev;
+        }
+    }
+
+    /*
+     * Return the last known inside point — this is the closest point to
+     * the boundary that is still inside the polygon.
+     */
+    (a_lat, a_lon, a_elev)
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,5 +1597,313 @@ mod tests {
                 assert_abs_diff_eq!(lon_o, lon_a, epsilon = 1e-15);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LiDAR flight line generation
+    // -----------------------------------------------------------------------
+
+    fn lidar_params() -> LidarPlanParams {
+        let sensor = LidarSensorParams::new(240_000.0, 100.0, 70.0, 0.0).unwrap();
+        LidarPlanParams::new(sensor, 100.0, 5.0).unwrap()
+    }
+
+    #[test]
+    fn lidar_line_spacing_matches_swath_overlap() {
+        /*
+         * swath_width(100m, 70°) ≈ 140.04 m
+         * spacing = 140.04 × (1 - 0.50) ≈ 70.02 m
+         */
+        let params = lidar_params();
+        let spacing = params.flight_line_spacing();
+        assert_abs_diff_eq!(spacing, 70.02, epsilon = 0.1);
+    }
+
+    #[test]
+    fn lidar_generates_correct_line_count() {
+        /*
+         * England bbox is ~1.1 km N-S, ~1.4 km E-W.
+         * At azimuth 0 (N-S), cross-track span ≈ 1.4 km.
+         * spacing ≈ 70 m → n_lines ≈ 1400/70 + 1 = 21.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = lidar_params();
+        let plan = generate_lidar_flight_lines(&bbox, 0.0, &params).unwrap();
+        assert!(plan.lines.len() >= 15, "LiDAR plan must generate sufficient lines");
+        assert!(plan.lines.len() <= 30, "LiDAR line count should be reasonable");
+    }
+
+    #[test]
+    fn lidar_waypoint_interval_controls_density() {
+        /*
+         * With 50 m waypoint interval and ~1.1 km along-track span,
+         * expect ~23 waypoints per line.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = lidar_params();
+        let plan = generate_lidar_flight_lines(&bbox, 0.0, &params).unwrap();
+        let wp_per_line = plan.lines[0].len();
+        assert!(wp_per_line >= 15, "waypoint count per line (got {wp_per_line})");
+        assert!(wp_per_line <= 35, "waypoint count per line (got {wp_per_line})");
+    }
+
+    #[test]
+    fn lidar_custom_waypoint_interval() {
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = lidar_params().with_waypoint_interval(100.0).unwrap();
+        let plan = generate_lidar_flight_lines(&bbox, 0.0, &params).unwrap();
+        /*
+         * At 100 m interval, roughly half as many waypoints as at 50 m.
+         */
+        let wp = plan.lines[0].len();
+        assert!(wp >= 8 && wp <= 18, "waypoint count at 100m interval (got {wp})");
+    }
+
+    #[test]
+    fn lidar_plan_carries_correct_azimuth() {
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = lidar_params();
+        let plan = generate_lidar_flight_lines(&bbox, 45.0, &params).unwrap();
+        assert_abs_diff_eq!(plan.azimuth_deg, 45.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn lidar_plan_params_point_density() {
+        let params = lidar_params();
+        let rho = params.point_density().unwrap();
+        assert_abs_diff_eq!(rho, 342.75, epsilon = 1.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Polygon boundary clipping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clip_convex_polygon_all_inside() {
+        use crate::math::geometry::Polygon;
+        /*
+         * Generate lines over the England bbox, clip to a polygon that
+         * fully encloses it. All waypoints should survive.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = FlightPlanParams::new(phantom4pro(), 0.05)
+            .unwrap()
+            .with_side_lap(60.0)
+            .unwrap()
+            .with_end_lap(80.0)
+            .unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let original_lines = plan.lines.len();
+
+        let poly = Polygon::new(vec![
+            (51.49, -0.11),
+            (51.49, -0.07),
+            (51.52, -0.07),
+            (51.52, -0.11),
+        ]);
+        let clipped = clip_to_polygon(plan, &poly);
+        assert_eq!(
+            clipped.lines.len(),
+            original_lines,
+            "all lines should survive when polygon fully encloses bbox"
+        );
+    }
+
+    #[test]
+    fn clip_removes_waypoints_outside_polygon() {
+        use crate::math::geometry::Polygon;
+        /*
+         * Clip to a polygon that covers only the western half of the bbox.
+         * Lines in the eastern half should be removed.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = FlightPlanParams::new(phantom4pro(), 0.05)
+            .unwrap()
+            .with_side_lap(60.0)
+            .unwrap()
+            .with_end_lap(80.0)
+            .unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let original_lines = plan.lines.len();
+
+        let poly = Polygon::new(vec![
+            (51.49, -0.11),
+            (51.49, -0.090),
+            (51.52, -0.090),
+            (51.52, -0.11),
+        ]);
+        let clipped = clip_to_polygon(plan, &poly);
+        assert!(
+            clipped.lines.len() < original_lines,
+            "clipping to west half should remove some lines"
+        );
+        assert!(
+            !clipped.lines.is_empty(),
+            "some lines should survive in the west half"
+        );
+
+        for line in &clipped.lines {
+            for &lon in line.lons() {
+                let lon_deg = lon.to_degrees();
+                assert!(
+                    lon_deg <= -0.089,
+                    "all surviving waypoints should be in the west half (got {lon_deg})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clip_polygon_with_hole_removes_interior() {
+        use crate::math::geometry::Polygon;
+        /*
+         * Polygon with a hole in the middle. Waypoints in the hole should
+         * be removed, splitting lines that cross the hole.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = FlightPlanParams::new(phantom4pro(), 0.05)
+            .unwrap()
+            .with_side_lap(60.0)
+            .unwrap()
+            .with_end_lap(80.0)
+            .unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+
+        let outer = vec![
+            (51.49, -0.11),
+            (51.49, -0.07),
+            (51.52, -0.07),
+            (51.52, -0.11),
+        ];
+        let hole = vec![
+            (51.503, -0.094),
+            (51.503, -0.086),
+            (51.507, -0.086),
+            (51.507, -0.094),
+        ];
+        let poly = Polygon::with_holes(outer, vec![hole]);
+        let clipped = clip_to_polygon(plan, &poly);
+
+        /*
+         * The hole should cause some lines to be split. Verify no
+         * surviving waypoint falls inside the hole.
+         */
+        for line in &clipped.lines {
+            for i in 0..line.len() {
+                let lat_deg = line.lats()[i].to_degrees();
+                let lon_deg = line.lons()[i].to_degrees();
+                let in_hole = lat_deg > 51.503
+                    && lat_deg < 51.507
+                    && lon_deg > -0.094
+                    && lon_deg < -0.086;
+                assert!(
+                    !in_hole,
+                    "waypoint at ({lat_deg:.6}, {lon_deg:.6}) should not be inside the hole"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clip_boundary_interpolation_extends_to_edge() {
+        use crate::math::geometry::Polygon;
+        /*
+         * Generate an E-W plan (azimuth 90°) over a bbox, then clip to
+         * a polygon whose north boundary bisects the bbox at lat=51.505.
+         * E-W lines run at fixed latitude — some cross the north edge
+         * of the polygon, triggering boundary interpolation. The clipped
+         * lines should have a waypoint very close to lat=51.505.
+         */
+        let bbox = BoundingBox {
+            min_lat: 51.500,
+            min_lon: -0.100,
+            max_lat: 51.510,
+            max_lon: -0.080,
+        };
+        let params = FlightPlanParams::new(phantom4pro(), 0.05)
+            .unwrap()
+            .with_side_lap(60.0)
+            .unwrap()
+            .with_end_lap(80.0)
+            .unwrap();
+        let plan = generate_flight_lines(&bbox, 90.0, &params).unwrap();
+
+        /*
+         * Polygon covers the southern half: lat in [51.49, 51.505].
+         * E-W lines at lat > 51.505 are entirely outside and are dropped.
+         * Lines that cross lat=51.505 should get boundary interpolation
+         * along their waypoint sequence.
+         *
+         * Wait — E-W lines at azimuth=90 run at fixed latitude, so they
+         * don't cross the boundary either. We need lines that actually
+         * traverse the boundary. Use azimuth=0 (N-S) instead — each line
+         * runs N to S, crossing lat=51.505. Clip to a polygon whose
+         * NORTH edge is at 51.505.
+         */
+        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+
+        let poly = Polygon::new(vec![
+            (51.499, -0.11),
+            (51.499, -0.079),
+            (51.505, -0.079),
+            (51.505, -0.11),
+        ]);
+        let clipped = clip_to_polygon(plan, &poly);
+        assert!(!clipped.lines.is_empty());
+
+        /*
+         * N-S lines cross lat=51.505. With bisection, there should be a
+         * waypoint within ~0.00001° (~1 m) of lat=51.505.
+         */
+        let mut closest_to_boundary = f64::INFINITY;
+        for line in &clipped.lines {
+            for &lat_rad in line.lats() {
+                let lat_deg = lat_rad.to_degrees();
+                let dist = (lat_deg - 51.505).abs();
+                if dist < closest_to_boundary {
+                    closest_to_boundary = dist;
+                }
+            }
+        }
+        assert!(
+            closest_to_boundary < 0.0001,
+            "bisection should produce a waypoint within ~10 m of the polygon boundary \
+             (closest: {closest_to_boundary:.7}°)"
+        );
     }
 }

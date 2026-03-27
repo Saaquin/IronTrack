@@ -18,7 +18,9 @@
 // RFC 7946 GeoJSON FeatureCollection serializer.
 //
 // RFC 7946 §3.1.1 mandates WGS84 coordinates in (longitude, latitude) order;
-// §3.1.1 also permits a third altitude element (elevation above MSL in metres).
+// §3.1.1 also permits a third altitude element (metres). The vertical datum is
+// identified by the `altitude_datum` property — consumers must read that field
+// before interpreting the Z coordinate.
 // `FlightLine::iter_lonlat_deg()` enforces the lon/lat order at the serialisation
 // boundary. Elevation is added as the Z element so terrain-following plans are
 // represented in full 3D — essential for autopilot consumption.
@@ -40,13 +42,19 @@ use crate::photogrammetry::FlightPlan;
 ///
 /// Each FlightLine becomes one Feature. Properties on each Feature:
 /// - `line_index`: zero-based integer index within the plan
-/// - `min_altitude_msl_m`: minimum MSL altitude across waypoints on this line (metres)
-/// - `max_altitude_msl_m`: maximum MSL altitude across waypoints on this line (metres)
+/// - `min_altitude_m`: minimum altitude across waypoints on this line (metres, in the plan's datum)
+/// - `max_altitude_m`: maximum altitude across waypoints on this line (metres, in the plan's datum)
 /// - `target_gsd_m`: target ground sample distance in metres/pixel
 /// - `side_lap_pct`: required side overlap percentage
 /// - `end_lap_pct`: required along-track (end) overlap percentage
-pub fn write_geojson(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
-    let collection = flight_plan_to_geojson(plan);
+pub fn write_geojson(
+    path: &Path,
+    plan: &FlightPlan,
+    safety_warning: Option<&str>,
+    attribution: Option<&str>,
+    disclaimer: Option<&str>,
+) -> Result<(), IoError> {
+    let collection = flight_plan_to_geojson(plan, safety_warning, attribution, disclaimer);
     let json_bytes = serde_json::to_vec_pretty(&collection)
         .map_err(|e| IoError::Serialization(e.to_string()))?;
     let mut file = std::fs::File::create(path)?;
@@ -57,7 +65,12 @@ pub fn write_geojson(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
 /// Convert a FlightPlan to a serde_json Value representing a GeoJSON
 /// FeatureCollection. Separated from `write_geojson` so callers can embed
 /// the collection in larger JSON documents or write to arbitrary writers.
-pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
+pub fn flight_plan_to_geojson(
+    plan: &FlightPlan,
+    safety_warning: Option<&str>,
+    attribution: Option<&str>,
+    disclaimer: Option<&str>,
+) -> Value {
     /*
      * Derive the datum tag from the first line. All lines in a plan are
      * expected to share the same datum (they all come from the same DEM pass),
@@ -108,8 +121,8 @@ pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
                 "properties": {
                     "line_index": idx,
                     "altitude_datum": line.altitude_datum.as_str(),
-                    "min_altitude_msl_m": min_alt,
-                    "max_altitude_msl_m": max_alt,
+                    "min_altitude_m": min_alt,
+                    "max_altitude_m": max_alt,
                     "target_gsd_m": plan.params.target_gsd_m,
                     "side_lap_pct": plan.params.side_lap_percent,
                     "end_lap_pct": plan.params.end_lap_percent
@@ -118,11 +131,29 @@ pub fn flight_plan_to_geojson(plan: &FlightPlan) -> Value {
         })
         .collect();
 
-    json!({
+    let mut collection = json!({
         "type": "FeatureCollection",
         "altitude_datum": datum_str,
         "features": features
-    })
+    });
+
+    /*
+     * Inject top-level metadata fields when present. All three are absent
+     * when the corresponding source data was not used (no terrain, DTM source).
+     * Consumers must surface attribution and disclaimer to satisfy the
+     * Copernicus DEM open-access license requirements.
+     */
+    if let Some(warning) = safety_warning {
+        collection["safety_warning"] = Value::String(warning.to_owned());
+    }
+    if let Some(attr) = attribution {
+        collection["attribution"] = Value::String(attr.to_owned());
+    }
+    if let Some(disc) = disclaimer {
+        collection["disclaimer"] = Value::String(disc.to_owned());
+    }
+
+    collection
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +207,7 @@ mod tests {
     #[test]
     fn feature_collection_structure() {
         let plan = minimal_plan(3, 4);
-        let fc = flight_plan_to_geojson(&plan);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
         assert_eq!(fc["type"], "FeatureCollection");
         let features = fc["features"].as_array().unwrap();
         assert_eq!(features.len(), 3, "one Feature per FlightLine");
@@ -192,7 +223,7 @@ mod tests {
     fn coordinate_precision_roundtrip() {
         // Coordinates must survive JSON serialization within 1e-9 degrees / 1e-9 m.
         let plan = minimal_plan(1, 2);
-        let fc = flight_plan_to_geojson(&plan);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
         let coords = fc["features"][0]["geometry"]["coordinates"]
             .as_array()
             .unwrap();
@@ -211,7 +242,7 @@ mod tests {
         // We test with expected values rather than magnitude comparison to catch edge cases
         // near the equator or antimeridian.
         let plan = minimal_plan(1, 2);
-        let fc = flight_plan_to_geojson(&plan);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
         let first_coord = &fc["features"][0]["geometry"]["coordinates"][0];
         let lon = first_coord[0].as_f64().unwrap();
         let lat = first_coord[1].as_f64().unwrap();
@@ -225,7 +256,7 @@ mod tests {
     #[test]
     fn properties_carry_plan_metadata() {
         let plan = minimal_plan(2, 3);
-        let fc = flight_plan_to_geojson(&plan);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
         let props = &fc["features"][0]["properties"];
         assert_eq!(props["line_index"], 0);
         assert_abs_diff_eq!(
@@ -245,12 +276,12 @@ mod tests {
         );
         // minimal_plan pushes elevation=100.0 for every waypoint, so both min and max are 100.0
         assert_abs_diff_eq!(
-            props["min_altitude_msl_m"].as_f64().unwrap(),
+            props["min_altitude_m"].as_f64().unwrap(),
             100.0,
             epsilon = 1e-12
         );
         assert_abs_diff_eq!(
-            props["max_altitude_msl_m"].as_f64().unwrap(),
+            props["max_altitude_m"].as_f64().unwrap(),
             100.0,
             epsilon = 1e-12
         );
@@ -261,7 +292,7 @@ mod tests {
         let plan = minimal_plan(2, 3);
         let dir = tempdir().unwrap();
         let path = dir.path().join("plan.geojson");
-        write_geojson(&path, &plan).unwrap();
+        write_geojson(&path, &plan, None, None, None).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: Value = serde_json::from_str(&contents).unwrap();
@@ -272,9 +303,52 @@ mod tests {
     #[test]
     fn line_index_property_increments() {
         let plan = minimal_plan(3, 2);
-        let fc = flight_plan_to_geojson(&plan);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
         for (i, feature) in fc["features"].as_array().unwrap().iter().enumerate() {
             assert_eq!(feature["properties"]["line_index"], i);
         }
+    }
+
+    #[test]
+    fn safety_warning_absent_when_none() {
+        let plan = minimal_plan(1, 2);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
+        assert!(
+            fc.get("safety_warning").is_none(),
+            "safety_warning must be absent when no warning is provided"
+        );
+    }
+
+    #[test]
+    fn safety_warning_present_when_some() {
+        let plan = minimal_plan(1, 2);
+        let warning = "test warning text";
+        let fc = flight_plan_to_geojson(&plan, Some(warning), None, None);
+        assert_eq!(
+            fc["safety_warning"].as_str().unwrap(),
+            warning,
+            "safety_warning must match the provided text"
+        );
+    }
+
+    #[test]
+    fn attribution_absent_when_none() {
+        let plan = minimal_plan(1, 2);
+        let fc = flight_plan_to_geojson(&plan, None, None, None);
+        assert!(fc.get("attribution").is_none());
+        assert!(fc.get("disclaimer").is_none());
+    }
+
+    #[test]
+    fn attribution_present_when_some() {
+        let plan = minimal_plan(1, 2);
+        let fc = flight_plan_to_geojson(
+            &plan,
+            None,
+            Some("test attribution"),
+            Some("test disclaimer"),
+        );
+        assert_eq!(fc["attribution"].as_str().unwrap(), "test attribution");
+        assert_eq!(fc["disclaimer"].as_str().unwrap(), "test disclaimer");
     }
 }

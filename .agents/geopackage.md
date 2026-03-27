@@ -190,3 +190,33 @@ db.create_scalar_function("ST_MinX", 1, true, |ctx| {
     Ok(minx)
 })?;
 ```
+
+## Required GeoPackage Contents (v0.2+)
+
+Every GeoPackage produced by IronTrack must contain:
+
+- Flight lines with full SoA coordinate data (lat, lon, elevation per waypoint)
+- `altitude_datum` tag per flight line (EGM2008 / EGM96 / WGS84_ELLIPSOIDAL / AGL) ✅
+- Sensor configuration profile (focal length, sensor dims, pixel pitch, overlap)
+- R-tree spatial index with all 7 sync triggers ✅
+- `irontrack_metadata` table: `schema_version` (e.g. "0.2.0"), `engine_version` (CARGO_PKG_VERSION)
+- Copernicus attribution and disclaimer string (legal compliance)
+- DSM penetration safety warning row (if terrain source is Copernicus DSM)
+- Mission summary statistics (line count, total distance, bounding box, est. endurance)
+- Cached DEM microtiles for the survey area (future — deferred past v0.2)
+
+### irontrack_metadata table DDL
+```sql
+CREATE TABLE IF NOT EXISTS irontrack_metadata (
+    key   TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
+Seed rows on GeoPackage creation:
+- `schema_version` = `"0.2.0"` (bump on breaking schema changes)
+- `engine_version` = value of `env!("CARGO_PKG_VERSION")` at compile time
+
+### Schema Version Compatibility
+- Newer engine opening older file: print warning to stderr, suggest re-export.
+- Older engine opening newer file: return `GpkgError::Init` with upgrade instructions.
+- Check on `GeoPackage::open()` by reading `irontrack_metadata` where key='schema_version'.

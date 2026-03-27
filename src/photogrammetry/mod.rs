@@ -20,6 +20,7 @@
 // and dynamic AGL adjustment.
 
 pub mod flightlines;
+pub mod lidar;
 pub mod sensor;
 
 pub use flightlines::FlightPlan;

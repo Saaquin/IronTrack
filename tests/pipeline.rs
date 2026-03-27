@@ -25,11 +25,12 @@
 //! they are deterministic and run offline.
 
 use irontrack::gpkg::GeoPackage;
-use irontrack::io::write_geojson;
+use irontrack::io::{write_dji_kmz, write_geojson, write_qgc_plan};
+use std::io::Read;
 use irontrack::photogrammetry::flightlines::{
-    generate_flight_lines, BoundingBox, FlightPlanParams,
+    generate_flight_lines, BoundingBox, FlightPlan, FlightPlanParams,
 };
-use irontrack::types::SensorParams;
+use irontrack::types::{AltitudeDatum, SensorParams};
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ fn full_pipeline_gpkg_and_geojson_are_created() {
     assert!(gpkg_path.exists(), "GeoPackage file must be created");
 
     // --- GeoJSON export ----------------------------------------------------
-    write_geojson(&geojson_path, &plan).unwrap();
+    write_geojson(&geojson_path, &plan, None, None, None).unwrap();
     assert!(geojson_path.exists(), "GeoJSON file must be created");
 }
 
@@ -167,7 +168,7 @@ fn geojson_feature_count_matches_plan_line_count() {
     let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
     let n_lines = plan.lines.len();
 
-    write_geojson(&geojson_path, &plan).unwrap();
+    write_geojson(&geojson_path, &plan, None, None, None).unwrap();
 
     let contents = std::fs::read_to_string(&geojson_path).unwrap();
     let fc: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -193,7 +194,7 @@ fn geojson_coordinates_are_lon_lat_order() {
     let geojson_path = dir.path().join("plan.geojson");
 
     let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
-    write_geojson(&geojson_path, &plan).unwrap();
+    write_geojson(&geojson_path, &plan, None, None, None).unwrap();
 
     let fc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&geojson_path).unwrap()).unwrap();
@@ -220,7 +221,7 @@ fn geojson_coordinates_have_elevation_component() {
     let geojson_path = dir.path().join("plan.geojson");
 
     let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
-    write_geojson(&geojson_path, &plan).unwrap();
+    write_geojson(&geojson_path, &plan, None, None, None).unwrap();
 
     let fc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&geojson_path).unwrap()).unwrap();
@@ -297,5 +298,174 @@ fn gpkg_contents_bbox_is_populated_after_insert() {
     assert!(
         max_y >= bbox.min_lat && max_y <= bbox.max_lat + 0.01,
         "max_y {max_y} should be within bbox latitude range"
+    );
+}
+
+#[test]
+fn qgc_plan_waypoint_count_altitude_and_commands() {
+    /*
+     * Generate a flight plan, export it to QGC .plan JSON, parse the JSON
+     * back, and verify:
+     *   - Total waypoint commands match the plan's waypoint count
+     *   - Command IDs are correct (16 = NAV_WAYPOINT, 206 = CAM_TRIGG_DIST)
+     *   - Altitude values survive the round-trip within floating-point epsilon
+     *   - Each line is bracketed by trigger-start / trigger-stop
+     */
+    let dir = tempdir().unwrap();
+    let plan_path = dir.path().join("mission.plan");
+
+    let params = standard_params();
+    let trigger_dist = params.photo_interval();
+    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params).unwrap();
+
+    /*
+     * QGC export requires WGS84 ellipsoidal or AGL altitudes. Stamp the
+     * flat-terrain plan as ellipsoidal — at 0 m elevation the difference
+     * between EGM2008 and WGS84 ellipsoidal is moot for this test.
+     */
+    let mut lines = base_plan.lines;
+    for line in &mut lines {
+        line.altitude_datum = AltitudeDatum::Wgs84Ellipsoidal;
+    }
+    let plan = FlightPlan {
+        params: base_plan.params,
+        azimuth_deg: base_plan.azimuth_deg,
+        lines,
+    };
+
+    let n_lines = plan.lines.len();
+    let total_waypoints: usize = plan.lines.iter().map(|l| l.len()).sum();
+
+    write_qgc_plan(&plan_path, &plan, trigger_dist).unwrap();
+
+    let contents = std::fs::read_to_string(&plan_path).unwrap();
+    let qgc: serde_json::Value = serde_json::from_str(&contents).unwrap();
+
+    assert_eq!(qgc["fileType"], "Plan");
+    assert_eq!(qgc["version"], 1);
+    assert_eq!(qgc["groundStation"], "IronTrack");
+
+    let items = qgc["mission"]["items"].as_array().unwrap();
+
+    /*
+     * Expected item count: per line → 1 trigger-start + N waypoints + 1 trigger-stop.
+     * Total = n_lines * 2 (triggers) + total_waypoints.
+     */
+    assert_eq!(
+        items.len(),
+        n_lines * 2 + total_waypoints,
+        "item count = trigger pairs + waypoints"
+    );
+
+    /*
+     * Verify command IDs: exactly total_waypoints items with command 16,
+     * and exactly n_lines * 2 items with command 206.
+     */
+    let wp_count = items
+        .iter()
+        .filter(|i| i["command"].as_u64().unwrap() == 16)
+        .count();
+    let trigger_count = items
+        .iter()
+        .filter(|i| i["command"].as_u64().unwrap() == 206)
+        .count();
+
+    assert_eq!(wp_count, total_waypoints, "waypoint command count");
+    assert_eq!(trigger_count, n_lines * 2, "trigger command count");
+
+    /*
+     * Verify altitude values survive the round-trip. Check the first
+     * waypoint of the first line (items[1] — after the first trigger-start).
+     */
+    let first_wp = &items[1];
+    let alt = first_wp["params"][6].as_f64().unwrap();
+    let expected_alt = plan.lines[0].elevations()[0];
+    assert!(
+        (alt - expected_alt).abs() < 1e-6,
+        "altitude must survive JSON round-trip (got {alt}, expected {expected_alt})"
+    );
+}
+
+#[test]
+fn dji_kmz_contains_egm96_altitudes_and_valid_structure() {
+    /*
+     * Generate a flight plan, stamp it as EGM96, export to DJI KMZ, unzip
+     * the archive, and verify:
+     *   - The archive contains wpmz/template.kml and wpmz/waylines.wpml
+     *   - template.kml has executeHeightMode=EGM96
+     *   - waylines.wpml has waypoints with correct altitude values
+     *   - Action groups trigger takePhoto at reachPoint
+     */
+    let dir = tempdir().unwrap();
+    let kmz_path = dir.path().join("mission.kmz");
+
+    let params = standard_params();
+    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params).unwrap();
+
+    /*
+     * DJI export requires EGM96. Stamp the flat-terrain plan as EGM96 —
+     * at 0 m elevation the numeric value is the same regardless of datum.
+     */
+    let mut lines = base_plan.lines;
+    for line in &mut lines {
+        line.altitude_datum = AltitudeDatum::Egm96;
+    }
+    let plan = FlightPlan {
+        params: base_plan.params,
+        azimuth_deg: base_plan.azimuth_deg,
+        lines,
+    };
+    let n_lines = plan.lines.len();
+
+    write_dji_kmz(&kmz_path, &plan).unwrap();
+
+    // Unzip and read both XML files
+    let file = std::fs::File::open(&kmz_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+
+    let mut template = String::new();
+    archive
+        .by_name("wpmz/template.kml")
+        .unwrap()
+        .read_to_string(&mut template)
+        .unwrap();
+
+    let mut waylines = String::new();
+    archive
+        .by_name("wpmz/waylines.wpml")
+        .unwrap()
+        .read_to_string(&mut waylines)
+        .unwrap();
+
+    // Verify template.kml mission config
+    assert!(
+        template.contains("<wpml:executeHeightMode>EGM96</wpml:executeHeightMode>"),
+        "template must declare EGM96 height mode"
+    );
+    assert!(
+        template.contains("<wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>"),
+        "template must have flyToWaylineMode"
+    );
+
+    // Verify waylines.wpml structure
+    assert!(
+        waylines.contains("<wpml:executeHeightMode>EGM96</wpml:executeHeightMode>"),
+        "waylines must declare EGM96 height mode"
+    );
+    let wayline_count = waylines.matches("<wpml:waylineId>").count();
+    assert_eq!(
+        wayline_count, n_lines,
+        "one wayline per flight line"
+    );
+
+    // Verify camera trigger action groups
+    let action_count = waylines.matches("<wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>").count();
+    assert_eq!(
+        action_count, n_lines,
+        "one actionGroup per flight line"
+    );
+    assert!(
+        waylines.contains("<wpml:actionActuatorFunc>takePhoto</wpml:actionActuatorFunc>"),
+        "action must be takePhoto"
     );
 }

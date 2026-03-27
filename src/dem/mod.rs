@@ -58,6 +58,31 @@ use crate::geodesy::geoid::Egm2008Model;
 use crate::types::GeoCoord;
 
 // ---------------------------------------------------------------------------
+// DemType
+// ---------------------------------------------------------------------------
+
+/// Classifies the underlying elevation dataset used by a [`TerrainEngine`].
+///
+/// The distinction is safety-critical for AGL flight planning:
+/// - A **DSM** surface includes forest canopy and rooftops, so AGL clearance
+///   over vegetation is underestimated by the canopy height (2–8 m for X-band
+///   radar such as Copernicus TanDEM-X).
+/// - A **DTM** is bare-earth only, so AGL clearance is accurate but the plan
+///   does not account for above-ground obstacles.
+///
+/// All Copernicus GLO-30 data is a DSM. Future DTM support (FABDEM,
+/// user-supplied bare-earth grids) will set this to [`DemType::Dtm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemType {
+    /// Digital Surface Model — includes canopy, buildings, and structures.
+    /// The mandatory DSM safety warning must be shown to the operator.
+    Dsm,
+    /// Digital Terrain Model — bare earth only.
+    /// No DSM canopy-penetration warning is needed.
+    Dtm,
+}
+
+// ---------------------------------------------------------------------------
 // ElevationSource
 // ---------------------------------------------------------------------------
 
@@ -163,6 +188,12 @@ pub struct TerrainEngine {
     /// against Copernicus elevations introduces a systematic bias of typically
     /// <0.5 m globally but up to 1–2 m in mountainous terrain.
     geoid: Egm2008Model,
+    /// Surface model classification of the underlying elevation dataset.
+    ///
+    /// Copernicus GLO-30 is always [`DemType::Dsm`]. Future bare-earth
+    /// sources (FABDEM, user DTM) will use [`DemType::Dtm`]. Callers must
+    /// check this field and emit the mandatory DSM safety warning when `Dsm`.
+    dem_type: DemType,
 }
 
 impl TerrainEngine {
@@ -174,6 +205,12 @@ impl TerrainEngine {
         Ok(Self {
             dem: DemProvider::new()?,
             geoid: Egm2008Model::new(),
+            /*
+             * Copernicus GLO-30 is always a DSM. When bare-earth DTM sources
+             * are added in a future release this field must be set accordingly
+             * so the mandatory safety warning is gated correctly.
+             */
+            dem_type: DemType::Dsm,
         })
     }
 
@@ -187,7 +224,17 @@ impl TerrainEngine {
         Ok(Self {
             dem: DemProvider::with_cache(cache),
             geoid: Egm2008Model::new(),
+            dem_type: DemType::Dsm,
         })
+    }
+
+    /// Return the surface model classification of this engine's data source.
+    ///
+    /// The caller must emit the mandatory DSM safety warning when this returns
+    /// [`DemType::Dsm`]. The warning is intentionally non-suppressible — X-band
+    /// canopy penetration creates a real collision risk in forested terrain.
+    pub fn dem_type(&self) -> DemType {
+        self.dem_type
     }
 
     /// Query terrain at `(lat, lon)`, falling back to sea level for invalid

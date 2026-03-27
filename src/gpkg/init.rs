@@ -28,11 +28,18 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::GpkgError;
 use crate::photogrammetry::FlightPlan;
 use crate::types::AltitudeDatum;
+
+/// Schema version understood by this build of IronTrack.
+///
+/// Increment this whenever a breaking change is made to the GeoPackage schema
+/// (new mandatory column, changed geometry type, renamed table, etc.).
+/// v0.1 files predate this table and are treated as schema_version = 1.
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 use super::binary;
 use super::rtree;
@@ -82,6 +89,7 @@ impl GeoPackage {
         rtree::register_st_functions(&gpkg.conn)?;
         gpkg.create_mandatory_tables()?;
         gpkg.seed_spatial_ref_sys()?;
+        gpkg.seed_irontrack_metadata()?;
         Ok(gpkg)
     }
 
@@ -94,11 +102,11 @@ impl GeoPackage {
     pub fn open(path: &Path) -> Result<Self, GpkgError> {
         let conn = Connection::open(path)?;
         let gpkg = Self { conn };
-        gpkg.apply_session_pragmas()?;
         /*
-         * Validate that the file was initialised as a GeoPackage before doing
-         * anything else. An application_id of 0 means a plain SQLite file.
-         * Catching this here prevents opaque late failures from missing tables.
+         * Validate the application_id before applying any session pragmas.
+         * `journal_mode = WAL` is persistent on SQLite files, so applying it
+         * before validation would leave side files (-wal, -shm) on any file
+         * that is later rejected — a violation of side-effect-free validation.
          */
         let app_id: i64 = gpkg
             .conn
@@ -108,7 +116,9 @@ impl GeoPackage {
                 "file is not a GeoPackage (application_id={app_id:#010x}, expected 0x47504b47)"
             )));
         }
+        gpkg.apply_session_pragmas()?;
         rtree::register_st_functions(&gpkg.conn)?;
+        gpkg.check_schema_version()?;
         Ok(gpkg)
     }
 
@@ -194,7 +204,38 @@ impl GeoPackage {
                 scope          TEXT NOT NULL,
                 CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)
             );
+
+            CREATE TABLE IF NOT EXISTS irontrack_metadata (
+                key   TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
             "#,
+        )?;
+        Ok(())
+    }
+
+    /// Seed `irontrack_metadata` with schema_version, engine_version, and
+    /// created_utc. Called once from `new()` after mandatory table creation.
+    ///
+    /// Uses `INSERT OR IGNORE` so re-running on an existing file is harmless —
+    /// the original creation timestamp and version are preserved.
+    fn seed_irontrack_metadata(&self) -> Result<(), GpkgError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO irontrack_metadata (key, value) VALUES ('schema_version', ?1)",
+            params![CURRENT_SCHEMA_VERSION.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO irontrack_metadata (key, value) VALUES ('engine_version', ?1)",
+            params![env!("CARGO_PKG_VERSION")],
+        )?;
+        /*
+         * SQLite's strftime with 'now' returns UTC. The Z suffix makes the
+         * ISO 8601 format unambiguous for downstream readers.
+         */
+        self.conn.execute(
+            "INSERT OR IGNORE INTO irontrack_metadata (key, value) \
+             VALUES ('created_utc', strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+            [],
         )?;
         Ok(())
     }
@@ -243,6 +284,85 @@ impl GeoPackage {
         Ok(())
     }
 
+    /// Check the `irontrack_metadata` schema version against `CURRENT_SCHEMA_VERSION`.
+    ///
+    /// Three cases:
+    /// - Table present, `schema_version` <= CURRENT_SCHEMA_VERSION: OK.
+    /// - Table absent (v0.1 file, schema_version implicitly = 1): print a
+    ///   warning to stderr recommending re-export, then continue — the file
+    ///   can still be read for data already present.
+    /// - Table present, `schema_version` > CURRENT_SCHEMA_VERSION: return
+    ///   `GpkgError::Init` — this engine cannot safely interpret a newer schema
+    ///   and must refuse rather than silently corrupt or misread the file.
+    fn check_schema_version(&self) -> Result<(), GpkgError> {
+        /*
+         * Probe for the table first. `sqlite_master` is always present and
+         * never requires a table lock, so this is safe on read-only files.
+         */
+        let table_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='table' AND name='irontrack_metadata'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !table_exists {
+            /*
+             * v0.1 files predate `irontrack_metadata`. Treat as schema_version=1.
+             * This is a compatibility warning, not an error — callers can still
+             * read the geometry data. Re-export is recommended so the datum tags
+             * and metadata are present.
+             */
+            eprintln!(
+                "warning: this GeoPackage was created by IronTrack v0.1 (no irontrack_metadata \
+                 table). Re-export with the current engine to add datum tags and schema metadata."
+            );
+            return Ok(());
+        }
+
+        /*
+         * Read the schema_version value.
+         *
+         * Two distinct failure modes are handled differently:
+         * - No row for 'schema_version': the table exists but was somehow
+         *   never seeded. Treat as v1 (forward-compat fallback is safe here).
+         * - Row present but value is not a valid u32: the metadata is corrupt
+         *   or was manually edited. Refuse to open rather than silently
+         *   misidentifying the schema level.
+         */
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM irontrack_metadata WHERE key='schema_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| GpkgError::Init(format!("failed to read schema_version: {e}")))?;
+
+        let file_version: u32 = match raw {
+            None => 1,
+            Some(s) => s.parse::<u32>().map_err(|_| {
+                GpkgError::Init(format!(
+                    "irontrack_metadata.schema_version is not a valid version number: {s:?}"
+                ))
+            })?,
+        };
+
+        if file_version > CURRENT_SCHEMA_VERSION {
+            return Err(GpkgError::Init(format!(
+                "GeoPackage schema version {file_version} is newer than this engine understands \
+                 (max {CURRENT_SCHEMA_VERSION}). Upgrade IronTrack to open this file."
+            )));
+        }
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Feature table management
     // -----------------------------------------------------------------------
@@ -259,9 +379,10 @@ impl GeoPackage {
         self.conn.execute_batch(&format!(
             r#"
             CREATE TABLE IF NOT EXISTS {table_name} (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                line_index INTEGER NOT NULL,
-                geom       BLOB    NOT NULL
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_index     INTEGER NOT NULL,
+                altitude_datum TEXT    NOT NULL DEFAULT 'EGM2008',
+                geom           BLOB    NOT NULL
             );
             "#
         ))?;
@@ -312,16 +433,15 @@ impl GeoPackage {
 
         let result = (|| {
             let mut stmt = self.conn.prepare(&format!(
-                "INSERT INTO {table_name} (line_index, geom) VALUES (?1, ?2)"
+                "INSERT INTO {table_name} (line_index, altitude_datum, geom) VALUES (?1, ?2, ?3)"
             ))?;
 
             for (idx, line) in plan.lines.iter().enumerate() {
                 /*
-                 * Collect (lon, lat, elevation_msl) triples so the blob
-                 * preserves altitude data as a WKB LineStringZ (type 1002).
-                 * The elevation comes from the terrain-adjusted waypoint
-                 * stored in FlightLine, or the flat-terrain MSL value when
-                 * no DEM is used.
+                 * Collect (lon, lat, elevation) triples so the blob preserves
+                 * altitude data as a WKB LineStringZ (type 1002). The elevation
+                 * is in whatever datum the line carries — altitude_datum records
+                 * the vertical reference so downstream readers never have to guess.
                  */
                 let coords: Vec<(f64, f64, f64)> = line
                     .iter_lonlat_deg()
@@ -329,7 +449,7 @@ impl GeoPackage {
                     .map(|((lon, lat), &elev)| (lon, lat, elev))
                     .collect();
                 let blob = binary::encode_linestring_z(&coords, 4326);
-                stmt.execute(params![idx as i64, blob])?;
+                stmt.execute(params![idx as i64, line.altitude_datum.as_str(), blob])?;
             }
 
             /*
@@ -382,6 +502,55 @@ impl GeoPackage {
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
+
+    /// Insert or replace a key/value row in `irontrack_metadata`.
+    ///
+    /// Uses `INSERT OR REPLACE` so this is safe to call on both new and
+    /// existing files — existing values are overwritten, not duplicated.
+    /// Required for injecting post-creation metadata such as the DSM safety
+    /// warning after a terrain-adjusted plan has been written.
+    pub fn upsert_metadata(&self, key: &str, value: &str) -> Result<(), GpkgError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO irontrack_metadata (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Read a single value from `irontrack_metadata` by key.
+    ///
+    /// Returns `Ok(None)` if the key does not exist, `Ok(Some(value))` if
+    /// it does, or `Err` on database error.
+    pub fn query_metadata(&self, key: &str) -> Result<Option<String>, GpkgError> {
+        use rusqlite::OptionalExtension;
+        let val: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM irontrack_metadata WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(val)
+    }
+
+    /// Append `suffix` to the `description` column in `gpkg_contents` for
+    /// `table_name`. Typically used to attach safety warning text to a layer
+    /// that downstream GIS viewers surface in the layer properties panel.
+    pub fn append_content_description(
+        &self,
+        table_name: &str,
+        suffix: &str,
+    ) -> Result<(), GpkgError> {
+        validate_identifier(table_name)?;
+        self.conn.execute(
+            "UPDATE gpkg_contents \
+             SET description = COALESCE(description, '') || ?1 \
+             WHERE table_name = ?2",
+            params![suffix, table_name],
+        )?;
+        Ok(())
+    }
 
     /// Count the rows in `table_name`.
     ///
@@ -677,5 +846,120 @@ mod tests {
     #[test]
     fn validate_identifier_rejects_empty_string() {
         assert!(validate_identifier("").is_err());
+    }
+
+    // --- Schema versioning (Phase 04C) ---
+
+    #[test]
+    fn new_gpkg_has_irontrack_metadata_table() {
+        let (_dir, gpkg) = tmp_gpkg();
+        let count: i32 = gpkg
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='table' AND name='irontrack_metadata'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "irontrack_metadata table must exist after new()");
+    }
+
+    #[test]
+    fn new_gpkg_seeds_schema_version() {
+        let (_dir, gpkg) = tmp_gpkg();
+        let version: String = gpkg
+            .conn
+            .query_row(
+                "SELECT value FROM irontrack_metadata WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version,
+            CURRENT_SCHEMA_VERSION.to_string(),
+            "schema_version must match CURRENT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn new_gpkg_seeds_engine_version_and_created_utc() {
+        let (_dir, gpkg) = tmp_gpkg();
+        let engine: String = gpkg
+            .conn
+            .query_row(
+                "SELECT value FROM irontrack_metadata WHERE key='engine_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(engine, env!("CARGO_PKG_VERSION"));
+
+        let created: String = gpkg
+            .conn
+            .query_row(
+                "SELECT value FROM irontrack_metadata WHERE key='created_utc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // ISO 8601 UTC: "YYYY-MM-DDTHH:MM:SSZ"
+        assert!(
+            created.ends_with('Z') && created.contains('T'),
+            "created_utc must be ISO 8601 UTC: {created}"
+        );
+    }
+
+    #[test]
+    fn open_v01_file_without_metadata_table_warns_and_succeeds() {
+        /*
+         * Simulate a v0.1 GeoPackage by creating a file and then dropping
+         * the irontrack_metadata table. `open()` must succeed with a stderr
+         * warning rather than returning an error.
+         */
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v01.gpkg");
+        {
+            let gpkg = GeoPackage::new(&path).unwrap();
+            gpkg.conn
+                .execute_batch("DROP TABLE irontrack_metadata;")
+                .unwrap();
+        }
+        // open() must not return an error for a v0.1 file
+        let result = GeoPackage::open(&path);
+        assert!(
+            result.is_ok(),
+            "open() must succeed on a v0.1 file: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn open_file_with_future_schema_version_returns_error() {
+        /*
+         * Simulate a file written by a future engine with schema_version = 999.
+         * `open()` must return GpkgError::Init rather than silently proceeding.
+         */
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("future.gpkg");
+        {
+            let gpkg = GeoPackage::new(&path).unwrap();
+            gpkg.conn
+                .execute_batch(
+                    "UPDATE irontrack_metadata SET value='999' WHERE key='schema_version';",
+                )
+                .unwrap();
+        }
+        match GeoPackage::open(&path) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("999"),
+                    "error message must include the file version: {msg}"
+                );
+            }
+            Ok(_) => panic!("open() must fail when file schema_version > CURRENT_SCHEMA_VERSION"),
+        }
     }
 }

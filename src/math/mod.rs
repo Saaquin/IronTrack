@@ -15,13 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod datum;
-pub mod dem;
-pub mod error;
-pub mod geodesy;
-pub mod gpkg;
-pub mod io;
-pub mod legal;
-pub mod math;
-pub mod photogrammetry;
-pub mod types;
+// Mathematical primitives: computational geometry, spatial predicates.
+
+pub mod geometry;

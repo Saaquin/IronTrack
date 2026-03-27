@@ -1,40 +1,27 @@
 # IronTrack Wiki
 
-This wiki is the human-readable layer above the research-heavy `docs/` set.
-It is meant for:
-
-- Maintainers who need to understand what the code does today.
-- Early adopters who need to know what is safe to try and what is not ready yet.
+This wiki is the human-readable layer above the research-heavy `docs/` set. It is meant for maintainers and early adopters.
 
 ## Start Here
 
-- [Maintainers](C:\Users\saaqu\dev\ironTrack\docs\wiki\maintainers.md) explains the current module layout, runtime flow, and operational constraints.
-- [Early Adopters](C:\Users\saaqu\dev\ironTrack\docs\wiki\early-adopters.md) explains the CLI, expected outputs, and present limitations.
+- [Engine Technical Reference](../99_engine_technical_reference.md) — Architectural overview, module map, and critical workflows.
+- [Maintainer Guide](maintainers.md) — Coding conventions, project pillars, and the future roadmap.
+- [User Guide (Early Adopters)](early-adopters.md) — CLI usage examples and current limitations.
 
-## Current State
+## Current Engine State (v0.1/v0.2-alpha)
 
-As of March 24, 2026, the codebase has working implementations for:
+The IronTrack Core Engine is a functional CLI tool capable of:
 
-- Copernicus DEM tile parsing and cache-backed terrain lookup
-- EGM96 and EGM2008 geoid height conversion
-- Flat-terrain flight-line generation
-- Terrain-aware overlap checking and altitude adjustment
-- GeoPackage creation and GeoJSON export
-
-The codebase also still has material v0.1 gaps:
-
-- Geodesic and UTM integration-test coverage is still mostly stubbed
-- The GeoPackage export path currently stores 2D geometry only
-- Human-facing maintainer/adopter docs were previously sparse
+- **Terrain Ingestion:** Copernicus GLO-30 tile parsing with automatic AWS S3 fetching.
+- **Geodesy:** Karney-Krüger 6th-order UTM and dual-geoid (EGM96/EGM2008) support.
+- **Planning:** Terrain-aware flight line generation with dynamic AGL adjustment.
+- **I/O:** 3D GeoPackage (LINESTRINGZ) and RFC 7946 GeoJSON export.
 
 ## Relationship To The Research Docs
 
-Use this wiki for orientation first. Then drop into the deeper docs when you need formulas or specification detail:
+Use this wiki for orientation. For deep mathematical formulas and domain-specific specifications, refer to the root `docs/` directory:
 
-- `docs/02_geodesy_foundations.md`
-- `docs/03_photogrammetry_spec.md`
-- `docs/04_geoPackage_architecture.md`
-- `docs/05_vertical_datum_engineering.md`
-- `docs/10_Rust_COG_Ingestion.md`
-- `docs/formula_reference.md`
-- `docs/formula_reference_08_10.md`
+- **Foundation:** `02_geodesy_foundations.md`, `03_photogrammetry_spec.md`.
+- **Infrastructure:** `04_geoPackage_architecture.md`, `10_Rust_COG_Ingestion.md`.
+- **Engineering:** `05_vertical_datum_engineering.md`, `09_dsm_vs_dtm.md`.
+- **Reference:** `formula_reference.md`, `formula_reference_08_10.md`.

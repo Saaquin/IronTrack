@@ -15,20 +15,24 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use irontrack::dem::DemType;
 use irontrack::dem::ElevationSource::{CopernicusDem, OceanFallback, SeaLevelFallback};
 use irontrack::dem::TerrainEngine;
 use irontrack::error::DemError;
 use irontrack::gpkg::GeoPackage;
-use irontrack::io::write_geojson;
+use irontrack::io::{parse_boundary, write_dji_kmz, write_geojson, write_qgc_plan};
+use irontrack::legal;
 use irontrack::photogrammetry::flightlines::{
-    adjust_for_terrain, generate_flight_lines, validate_overlap, BoundingBox, FlightPlan,
-    FlightPlanParams,
+    adjust_for_terrain, clip_to_polygon, generate_flight_lines, generate_lidar_flight_lines,
+    validate_overlap, BoundingBox, FlightPlan, FlightPlanParams, LidarPlanParams,
 };
+use irontrack::photogrammetry::lidar::LidarSensorParams;
 use irontrack::types::{AltitudeDatum, SensorParams};
 
 // ---------------------------------------------------------------------------
@@ -82,17 +86,27 @@ enum Commands {
     Plan {
         // --- Bounding box ---------------------------------------------------
         /// Minimum (south) latitude in decimal degrees.
-        #[arg(long)]
+        /// Required unless --boundary is provided.
+        #[arg(long, default_value = "0.0")]
         min_lat: f64,
         /// Minimum (west) longitude in decimal degrees.
-        #[arg(long)]
+        /// Required unless --boundary is provided.
+        #[arg(long, default_value = "0.0")]
         min_lon: f64,
         /// Maximum (north) latitude in decimal degrees.
-        #[arg(long)]
+        /// Required unless --boundary is provided.
+        #[arg(long, default_value = "0.0")]
         max_lat: f64,
         /// Maximum (east) longitude in decimal degrees.
-        #[arg(long)]
+        /// Required unless --boundary is provided.
+        #[arg(long, default_value = "0.0")]
         max_lon: f64,
+
+        /// KML/KMZ boundary file (alternative to --min-lat/--max-lat etc.).
+        /// If provided, the survey area is defined by the polygon(s) in the
+        /// file and the bbox flags are ignored.
+        #[arg(long, value_name = "PATH")]
+        boundary: Option<PathBuf>,
 
         // --- Sensor ---------------------------------------------------------
         /// Sensor preset. Choices: phantom4pro, mavic3, ixm100.
@@ -139,6 +153,27 @@ enum Commands {
         #[arg(long)]
         altitude_msl: Option<f64>,
 
+        // --- LiDAR ----------------------------------------------------------
+        /// Mission type: camera (default) or lidar.
+        #[arg(long, default_value = "camera", value_name = "TYPE")]
+        mission_type: String,
+
+        /// LiDAR pulse repetition rate in Hz (e.g. 240000 for 240 kHz).
+        #[arg(long, value_name = "HZ")]
+        lidar_prr: Option<f64>,
+
+        /// LiDAR mirror scan rate in Hz.
+        #[arg(long, value_name = "HZ")]
+        lidar_scan_rate: Option<f64>,
+
+        /// LiDAR total angular field of view in degrees.
+        #[arg(long, value_name = "DEG")]
+        lidar_fov: Option<f64>,
+
+        /// Target point density in pts/m² (LiDAR only).
+        #[arg(long, value_name = "PTS")]
+        target_density: Option<f64>,
+
         // --- Terrain --------------------------------------------------------
         /// Run terrain-aware validation and altitude adjustment using cached
         /// Copernicus DEM tiles. If a required tile is not in the local cache
@@ -160,6 +195,15 @@ enum Commands {
         /// GeoJSON output file path (optional; useful for web map preview).
         #[arg(long, value_name = "PATH")]
         geojson: Option<PathBuf>,
+
+        /// QGroundControl .plan output file path (optional; for ArduPilot/PX4 autopilots).
+        #[arg(long, value_name = "PATH")]
+        qgc_plan: Option<PathBuf>,
+
+        /// DJI .kmz output file path (optional; for DJI Enterprise autopilots).
+        /// Altitudes are automatically converted to EGM96 as required by DJI.
+        #[arg(long, value_name = "PATH")]
+        dji_kmz: Option<PathBuf>,
     },
 }
 
@@ -176,6 +220,7 @@ fn main() {
             min_lon,
             max_lat,
             max_lon,
+            boundary,
             sensor,
             focal_length_mm,
             sensor_width_mm,
@@ -187,15 +232,23 @@ fn main() {
             end_lap,
             azimuth,
             altitude_msl,
+            mission_type,
+            lidar_prr,
+            lidar_scan_rate,
+            lidar_fov,
+            target_density,
             terrain,
             datum,
             output,
             geojson,
+            qgc_plan,
+            dji_kmz,
         }) => run_plan(PlanArgs {
             min_lat,
             min_lon,
             max_lat,
             max_lon,
+            boundary,
             sensor,
             focal_length_mm,
             sensor_width_mm,
@@ -207,10 +260,17 @@ fn main() {
             end_lap,
             azimuth,
             altitude_msl,
+            mission_type,
+            lidar_prr,
+            lidar_scan_rate,
+            lidar_fov,
+            target_density,
             terrain,
             datum,
             output,
             geojson,
+            qgc_plan,
+            dji_kmz,
         }),
         None => {
             println!("IronTrack v{}", env!("CARGO_PKG_VERSION"));
@@ -287,6 +347,7 @@ struct PlanArgs {
     min_lon: f64,
     max_lat: f64,
     max_lon: f64,
+    boundary: Option<PathBuf>,
     sensor: String,
     focal_length_mm: Option<f64>,
     sensor_width_mm: Option<f64>,
@@ -298,10 +359,17 @@ struct PlanArgs {
     end_lap: f64,
     azimuth: f64,
     altitude_msl: Option<f64>,
+    mission_type: String,
+    lidar_prr: Option<f64>,
+    lidar_scan_rate: Option<f64>,
+    lidar_fov: Option<f64>,
+    target_density: Option<f64>,
     terrain: bool,
     datum: String,
     output: PathBuf,
     geojson: Option<PathBuf>,
+    qgc_plan: Option<PathBuf>,
+    dji_kmz: Option<PathBuf>,
 }
 
 fn run_plan(args: PlanArgs) -> Result<()> {
@@ -315,68 +383,231 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         other => bail!("unknown datum {other:?}. Choose: egm2008, egm96, ellipsoidal, agl."),
     };
 
-    // --- Resolve sensor parameters -----------------------------------------
+    // --- Resolve boundary (bbox or KML polygon) ----------------------------
 
-    let sensor_params = resolve_sensor(&args)?;
+    let boundary_polygons = if let Some(ref boundary_path) = args.boundary {
+        let polys = parse_boundary(boundary_path)
+            .with_context(|| format!("cannot parse boundary file {}", boundary_path.display()))?;
+        if polys.is_empty() {
+            bail!("boundary file contains no polygons");
+        }
+        Some(polys)
+    } else {
+        None
+    };
 
-    // --- Build FlightPlanParams --------------------------------------------
+    /*
+     * Build the bounding box. If --boundary was provided, derive it from the
+     * polygon's axis-aligned extent. Otherwise use the explicit CLI args.
+     * When no boundary is given, validate that the bbox has positive extent
+     * (the defaults are all 0.0 which would produce a degenerate box).
+     */
+    if boundary_polygons.is_none()
+        && (args.min_lat == 0.0 && args.max_lat == 0.0 && args.min_lon == 0.0 && args.max_lon == 0.0)
+    {
+        bail!(
+            "either --boundary or all of --min-lat/--max-lat/--min-lon/--max-lon must be provided"
+        );
+    }
 
-    let gsd_m = args.gsd_cm / 100.0;
-    let params = FlightPlanParams::new(sensor_params, gsd_m)
-        .context("invalid sensor or GSD")?
-        .with_side_lap(args.side_lap)
-        .context("invalid side-lap value")?
-        .with_end_lap(args.end_lap)
-        .context("invalid end-lap value")?;
+    let bbox = if let Some(ref polys) = boundary_polygons {
+        let (mut min_lat, mut min_lon, mut max_lat, mut max_lon) = polys[0].bbox();
+        for poly in polys.iter().skip(1) {
+            let (a, b, c, d) = poly.bbox();
+            min_lat = min_lat.min(a);
+            min_lon = min_lon.min(b);
+            max_lat = max_lat.max(c);
+            max_lon = max_lon.max(d);
+        }
+        BoundingBox { min_lat, min_lon, max_lat, max_lon }
+    } else {
+        BoundingBox {
+            min_lat: args.min_lat,
+            min_lon: args.min_lon,
+            max_lat: args.max_lat,
+            max_lon: args.max_lon,
+        }
+    };
 
-    let params = if let Some(alt) = args.altitude_msl {
-        FlightPlanParams {
-            flight_altitude_msl: Some(alt),
-            ..params
+    // --- Resolve mission type and generate flight lines --------------------
+
+    let is_lidar = args.mission_type.to_lowercase() == "lidar";
+
+    let (plan, params) = if is_lidar {
+        /*
+         * LiDAR mission: line spacing from swath overlap, not GSD.
+         * Require --lidar-prr, --lidar-scan-rate, --lidar-fov.
+         */
+        let prr = args.lidar_prr.context("--lidar-prr is required for LiDAR missions")?;
+        let scan_rate = args.lidar_scan_rate.context("--lidar-scan-rate is required for LiDAR missions")?;
+        let fov = args.lidar_fov.context("--lidar-fov is required for LiDAR missions")?;
+
+        let sensor = LidarSensorParams::new(prr, scan_rate, fov, 0.0)
+            .context("invalid LiDAR sensor parameters")?;
+
+        /*
+         * LiDAR AGL drives swath width and point density. When --altitude-msl
+         * is provided, it sets both the AGL (for swath math) and the MSL
+         * waypoint elevation. For flat-terrain planning (no DEM), AGL ≈ MSL
+         * is a reasonable assumption. Default: 100 m.
+         *
+         * A dedicated --lidar-agl flag would separate these concerns; for now
+         * the altitude_msl value is used directly as AGL, which is correct
+         * for the common case of flat-terrain survey planning at low altitude.
+         */
+        let agl = args.altitude_msl.unwrap_or(100.0);
+        let ground_speed = if let Some(density) = args.target_density {
+            irontrack::photogrammetry::lidar::required_speed_for_density(&sensor, agl, density)
+                .context("cannot compute speed for target density")?
+        } else {
+            10.0
+        };
+
+        let mut lidar_params = LidarPlanParams::new(sensor, agl, ground_speed)
+            .context("invalid LiDAR plan parameters")?
+            .with_side_lap(args.side_lap)
+            .context("invalid side-lap value")?;
+        lidar_params.flight_altitude_msl = args.altitude_msl;
+
+        let p = generate_lidar_flight_lines(&bbox, args.azimuth, &lidar_params)
+            .context("LiDAR flight line generation failed")?;
+
+        let density = lidar_params.point_density().unwrap_or(0.0);
+        println!(
+            "LiDAR mission: {:.0} pts/m² at {:.1} m/s, {:.0} m AGL, {:.0}° FOV",
+            density, ground_speed, agl, fov
+        );
+
+        let pm = p.params.clone();
+        (p, pm)
+    } else {
+        // --- Camera mission (default) --------------------------------------
+
+        let sensor_params = resolve_sensor(&args)?;
+        let gsd_m = args.gsd_cm / 100.0;
+        let params = FlightPlanParams::new(sensor_params, gsd_m)
+            .context("invalid sensor or GSD")?
+            .with_side_lap(args.side_lap)
+            .context("invalid side-lap value")?
+            .with_end_lap(args.end_lap)
+            .context("invalid end-lap value")?;
+
+        let params = if let Some(alt) = args.altitude_msl {
+            FlightPlanParams {
+                flight_altitude_msl: Some(alt),
+                ..params
+            }
+        } else {
+            params
+        };
+
+        let p = generate_flight_lines(&bbox, args.azimuth, &params)
+            .context("flight line generation failed")?;
+        let pm = p.params.clone();
+        (p, pm)
+    };
+
+    // --- Clip to polygon boundary (if provided) ----------------------------
+
+    /*
+     * When --boundary is used, the flight lines are generated over the
+     * polygon's bounding box, then clipped to the actual polygon shape.
+     * For multi-polygon files, each polygon clips the full grid
+     * independently and the results are merged.
+     */
+    let plan = if let Some(ref polys) = boundary_polygons {
+        let mut all_lines = Vec::new();
+        for poly in polys {
+            let clipped = clip_to_polygon(
+                FlightPlan {
+                    params: plan.params.clone(),
+                    azimuth_deg: plan.azimuth_deg,
+                    lines: plan.lines.clone(),
+                },
+                poly,
+            );
+            all_lines.extend(clipped.lines);
+        }
+        FlightPlan {
+            params: plan.params,
+            azimuth_deg: plan.azimuth_deg,
+            lines: all_lines,
         }
     } else {
-        params
+        plan
     };
-
-    // --- Validate and build BoundingBox ------------------------------------
-
-    let bbox = BoundingBox {
-        min_lat: args.min_lat,
-        min_lon: args.min_lon,
-        max_lat: args.max_lat,
-        max_lon: args.max_lon,
-    };
-
-    // --- Generate flat-terrain flight lines --------------------------------
-
-    let plan = generate_flight_lines(&bbox, args.azimuth, &params)
-        .context("flight line generation failed")?;
 
     println!(
         "Generated {} flight line(s) over {:.4}°N {:.4}°E → {:.4}°N {:.4}°E",
         plan.lines.len(),
-        args.min_lat,
-        args.min_lon,
-        args.max_lat,
-        args.max_lon,
+        bbox.min_lat,
+        bbox.min_lon,
+        bbox.max_lat,
+        bbox.max_lon,
     );
 
     // --- Terrain-aware validation and adjustment (optional) ----------------
 
-    let (mut plan, engine) = if args.terrain {
+    /*
+     * Terrain adjustment uses camera-specific swath footprint sampling
+     * (5-point per exposure). For LiDAR missions this doesn't apply —
+     * LiDAR terrain following is handled differently (continuous swath,
+     * not discrete exposures). Skip terrain adjustment for LiDAR.
+     */
+    let (mut plan, engine) = if args.terrain && !is_lidar {
         apply_terrain_adjustment(plan, &params)?
     } else {
+        if args.terrain && is_lidar {
+            eprintln!("[Note] Terrain adjustment not yet supported for LiDAR missions.");
+        }
         (plan, None)
+    };
+
+    // --- DSM safety warning ------------------------------------------------
+
+    /*
+     * Determine whether a DSM warning is needed before the datum conversion
+     * block that may partially move `engine`. DSM_WARNING_TEXT is 'static so
+     * dsm_warning outlives the engine regardless of what happens to it below.
+     *
+     * If the terrain engine used a DSM (currently always the case for
+     * Copernicus), emit the mandatory collision-risk warning to stderr and
+     * record the warning text in all output artefacts. This cannot be
+     * suppressed: X-band canopy penetration creates a real AGL underestimation
+     * risk. The warning is gated on dem_type so future bare-earth DTM sources
+     * do not trigger it.
+     */
+    /*
+     * Two paths can access DSM (Copernicus) terrain data:
+     *   (a) terrain adjustment was used — engine is Some and always DSM
+     *   (b) datum conversion to/from AGL — to_datum() fetches DEM elevations
+     *       when source or target datum is AGL; any TerrainEngine created
+     *       here is also Copernicus and therefore DSM
+     * Both paths must emit the warning. `dsm_warning` is a 'static reference
+     * so it outlives any engine move that happens in the datum block below.
+     */
+    let agl_datum_conversion_uses_dem = plan.lines.iter().any(|l| l.altitude_datum != target_datum)
+        && (target_datum == AltitudeDatum::Agl
+            || plan.lines.iter().any(|l| l.altitude_datum == AltitudeDatum::Agl));
+
+    let dsm_warning: Option<&str> = if engine
+        .as_ref()
+        .is_some_and(|e| e.dem_type() == DemType::Dsm)
+        || agl_datum_conversion_uses_dem
+    {
+        Some(legal::DSM_WARNING_TEXT)
+    } else {
+        None
     };
 
     // --- Convert to target vertical datum ----------------------------------
 
-    if plan.lines.first().map(|l| l.altitude_datum) != Some(target_datum) {
+    if plan.lines.iter().any(|l| l.altitude_datum != target_datum) {
         let engine = match engine {
             Some(e) => e,
             None => TerrainEngine::new().context("cannot initialise terrain engine for datum conversion")?,
         };
-        
+
         let mut converted_lines = Vec::with_capacity(plan.lines.len());
         for line in &plan.lines {
             converted_lines.push(line.to_datum(target_datum, &engine)?);
@@ -384,6 +615,24 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         plan.lines = converted_lines;
         println!("Altitude datum conversion: applied (target: {target_datum}).");
     }
+
+    // --- Copernicus attribution (when DSM data was used) -------------------
+
+    /*
+     * Attribution is legally required in any product derived from Copernicus
+     * DEM data. Gate on the same condition as the DSM warning — only inject
+     * into output artefacts when terrain or AGL datum conversion actually
+     * accessed Copernicus tiles.
+     */
+    let attribution_string = legal::copernicus_attribution_default();
+    let (attribution, disclaimer): (Option<&str>, Option<&str>) = if dsm_warning.is_some() {
+        (
+            Some(attribution_string.as_str()),
+            Some(legal::COPERNICUS_DISCLAIMER),
+        )
+    } else {
+        (None, None)
+    };
 
     // --- Export to GeoPackage ----------------------------------------------
 
@@ -394,19 +643,159 @@ fn run_plan(args: PlanArgs) -> Result<()> {
     gpkg.insert_flight_plan("flight_lines", &plan)
         .context("failed to insert flight plan into GeoPackage")?;
 
+    if let Some(warning) = dsm_warning {
+        gpkg.upsert_metadata("safety_dsm_warning", warning)
+            .context("failed to write DSM warning to GeoPackage metadata")?;
+        gpkg.append_content_description("flight_lines", &format!("; {warning}"))
+            .context("failed to append DSM warning to gpkg_contents description")?;
+        gpkg.upsert_metadata("copernicus_attribution", &attribution_string)
+            .context("failed to write Copernicus attribution to GeoPackage metadata")?;
+        gpkg.upsert_metadata("copernicus_disclaimer", legal::COPERNICUS_DISCLAIMER)
+            .context("failed to write Copernicus disclaimer to GeoPackage metadata")?;
+    }
+
     println!("GeoPackage written: {}", args.output.display());
 
     // --- Export to GeoJSON (optional) --------------------------------------
 
     if let Some(geojson_path) = &args.geojson {
-        write_geojson(geojson_path, &plan)
+        write_geojson(geojson_path, &plan, dsm_warning, attribution, disclaimer)
             .with_context(|| format!("cannot write GeoJSON to {}", geojson_path.display()))?;
         println!("GeoJSON written:    {}", geojson_path.display());
     }
 
-    // --- Print summary -----------------------------------------------------
+    // --- Export to QGroundControl .plan (optional) -------------------------
 
-    print_summary(&plan, &params, args.gsd_cm, &args.sensor);
+    /*
+     * ArduPilot's MAV_FRAME_GLOBAL interprets altitude as WGS84 ellipsoidal.
+     * If the plan is in a different non-AGL datum (e.g. EGM2008), the QGC
+     * export must convert to WGS84 ellipsoidal first. AGL plans are left
+     * as-is since they use MAV_FRAME_GLOBAL_RELATIVE_ALT.
+     */
+    if let Some(qgc_path) = &args.qgc_plan {
+        if is_lidar {
+            bail!("--qgc-plan is not supported for LiDAR missions. \
+                   QGC camera trigger commands do not apply to LiDAR sensors.");
+        }
+        let trigger_dist = params.photo_interval();
+        let qgc_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+
+        /*
+         * ArduPilot MAV_FRAME_GLOBAL = WGS84 ellipsoidal. If the plan is
+         * in a geoid-based datum (EGM2008, EGM96), convert to ellipsoidal
+         * before writing. AGL plans are passed through as-is.
+         */
+        let needs_conversion =
+            qgc_datum != AltitudeDatum::Agl && qgc_datum != AltitudeDatum::Wgs84Ellipsoidal;
+
+        let qgc_lines: Option<Vec<_>> = if needs_conversion {
+            let engine = TerrainEngine::new()
+                .context("cannot initialise terrain engine for QGC datum conversion")?;
+            let mut converted = Vec::with_capacity(plan.lines.len());
+            for line in &plan.lines {
+                converted.push(
+                    line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+                        .context("QGC datum conversion to WGS84 ellipsoidal failed")?,
+                );
+            }
+            Some(converted)
+        } else {
+            None
+        };
+
+        /*
+         * Build a temporary FlightPlan referencing the converted lines if
+         * conversion was needed, or borrow the original plan's lines.
+         */
+        let qgc_plan = FlightPlan {
+            params: plan.params.clone(),
+            azimuth_deg: plan.azimuth_deg,
+            lines: qgc_lines.unwrap_or_else(|| plan.lines.clone()),
+        };
+
+        write_qgc_plan(qgc_path, &qgc_plan, trigger_dist)
+            .with_context(|| format!("cannot write QGC plan to {}", qgc_path.display()))?;
+        let exported_datum = qgc_plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum.as_str())
+            .unwrap_or("N/A");
+        println!("QGC plan written:   {} (datum: {exported_datum})", qgc_path.display());
+    }
+
+    // --- Export to DJI .kmz (optional) ------------------------------------
+
+    /*
+     * DJI autopilots execute static EGM96 altitudes — no onboard terrain
+     * correction. Convert the plan to EGM96 before writing. This is
+     * non-negotiable: EGM2008 != EGM96 (0.5–10+ m difference).
+     */
+    if let Some(dji_path) = &args.dji_kmz {
+        if is_lidar {
+            bail!("--dji-kmz is not supported for LiDAR missions. \
+                   DJI takePhoto actions do not apply to LiDAR sensors.");
+        }
+        let dji_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+
+        let dji_plan = if dji_datum != AltitudeDatum::Egm96 {
+            let engine = TerrainEngine::new()
+                .context("cannot initialise terrain engine for DJI datum conversion")?;
+            let mut converted = Vec::with_capacity(plan.lines.len());
+            for line in &plan.lines {
+                converted.push(
+                    line.to_datum(AltitudeDatum::Egm96, &engine)
+                        .context("DJI datum conversion to EGM96 failed")?,
+                );
+            }
+            FlightPlan {
+                params: plan.params.clone(),
+                azimuth_deg: plan.azimuth_deg,
+                lines: converted,
+            }
+        } else {
+            FlightPlan {
+                params: plan.params.clone(),
+                azimuth_deg: plan.azimuth_deg,
+                lines: plan.lines.clone(),
+            }
+        };
+
+        write_dji_kmz(dji_path, &dji_plan)
+            .with_context(|| format!("cannot write DJI KMZ to {}", dji_path.display()))?;
+        println!("DJI KMZ written:    {} (datum: EGM96)", dji_path.display());
+    }
+
+    // --- Print summary, attribution, and DSM warning -----------------------
+
+    /*
+     * Output order per spec:
+     *   1. Mission summary (stdout)
+     *   2. Copernicus attribution (stdout) — only when Copernicus was used
+     *   3. DSM safety warning (stderr)    — only when Copernicus was used
+     */
+    if !is_lidar {
+        print_summary(&plan, &params, args.gsd_cm, &args.sensor);
+    }
+
+    if dsm_warning.is_some() {
+        legal::print_copernicus_attribution();
+        /*
+         * Flush stdout before writing to stderr. `println!` is line-buffered
+         * on terminals but block-buffered on pipes and redirected files, so
+         * without an explicit flush the DSM warning can appear before the
+         * mission summary or attribution in non-terminal contexts.
+         */
+        let _ = std::io::stdout().flush();
+        legal::print_dsm_warning();
+    }
 
     Ok(())
 }
