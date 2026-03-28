@@ -16,6 +16,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod nmea;
+#[cfg(feature = "serial")]
 pub mod serial_manager;
 pub mod server;
 pub mod telemetry;

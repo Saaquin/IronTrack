@@ -5,6 +5,12 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Open-source flight management and aerial survey planning engine"
 
+[features]
+default = []
+# Enable serial port support (requires libudev-dev on Linux).
+# Used by the v0.4 daemon for NMEA/trigger controller communication.
+serial = ["serialport", "tokio-serial"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.31", features = ["bundled", "functions"] }
@@ -28,8 +34,8 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 futures-util = "0.3"
-serialport = "4"
-tokio-serial = "5"
+serialport = { version = "4", optional = true }
+tokio-serial = { version = "5", optional = true }
 mdns-sd = "0.13"
 nalgebra = "0.33"
 

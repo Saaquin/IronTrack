@@ -84,6 +84,7 @@ impl FmsState {
 
 pub type SharedState = Arc<RwLock<FmsState>>;
 
+#[cfg(feature = "serial")]
 use crate::network::serial_manager::SerialManager;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
@@ -102,11 +103,20 @@ pub async fn run_server(
             run_mock_telemetry(state_clone, speed).await;
         });
     } else {
-        // Start real serial manager if not mocking
-        let serial_mgr = SerialManager::new(gnss_vid, gnss_pid, state.clone());
-        tokio::spawn(async move {
-            serial_mgr.run().await;
-        });
+        // Start real serial manager if not mocking.
+        // Requires the "serial" feature (libudev-dev on Linux).
+        #[cfg(feature = "serial")]
+        {
+            let serial_mgr = SerialManager::new(gnss_vid, gnss_pid, state.clone());
+            tokio::spawn(async move {
+                serial_mgr.run().await;
+            });
+        }
+        #[cfg(not(feature = "serial"))]
+        {
+            let _ = (gnss_vid, gnss_pid);
+            eprintln!("warning: serial port support disabled (compile with --features serial)");
+        }
     }
 
     // Start mDNS advertising
