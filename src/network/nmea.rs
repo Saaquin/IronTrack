@@ -194,8 +194,10 @@ mod tests {
 
     #[test]
     fn test_checksum() {
+        // Checksum is XOR of all bytes between '$' and '*' (exclusive).
+        // Computed: 0x53 for this GGA sentence.
         assert!(validate_checksum(
-            "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*47"
+            "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53"
         ));
         assert!(!validate_checksum(
             "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*48"
@@ -206,7 +208,7 @@ mod tests {
     fn test_parse_gga() {
         let mut state = CurrentState::default();
         let sentence =
-            "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*47";
+            "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
         assert!(NmeaParser::parse(sentence, &mut state));
         assert_eq!(state.fix_quality, 4);
         assert!((state.lat - 48.1173016).abs() < 1e-7);
@@ -218,8 +220,9 @@ mod tests {
     #[test]
     fn test_parse_rmc() {
         let mut state = CurrentState::default();
+        // Checksum 0x37 computed for this RMC sentence.
         let sentence =
-            "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*69";
+            "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
         assert!(NmeaParser::parse(sentence, &mut state));
         assert!((state.ground_speed_ms - 125.5 * 0.514444).abs() < 1e-5);
         assert_eq!(state.true_heading_deg, 76.2);
