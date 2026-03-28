@@ -181,18 +181,22 @@ pub fn flight_plan_to_qgc(plan: &FlightPlan, trigger_distance_m: f64) -> Value {
             continue;
         }
 
+        let is_survey = !line.is_transit;
+
         /*
          * Start-of-line: enable distance-based camera triggering.
-         * Command 206 param3=1 triggers the camera once immediately, then
-         * continues at the specified interval.
+         * Only for survey legs — transit/turn segments fly without
+         * camera activation to avoid wasting exposures off-grid.
          */
-        items.push(simple_item(
-            seq,
-            MAV_CMD_DO_SET_CAM_TRIGG_DIST,
-            MAV_FRAME_MISSION,
-            [trigger_distance_m, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-        ));
-        seq += 1;
+        if is_survey {
+            items.push(simple_item(
+                seq,
+                MAV_CMD_DO_SET_CAM_TRIGG_DIST,
+                MAV_FRAME_MISSION,
+                [trigger_distance_m, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ));
+            seq += 1;
+        }
 
         /*
          * Waypoints along the flight line.
@@ -219,16 +223,17 @@ pub fn flight_plan_to_qgc(plan: &FlightPlan, trigger_distance_m: f64) -> Value {
         }
 
         /*
-         * End-of-line: disable camera triggering. Distance = 0 stops the
-         * distance-based trigger without firing an additional exposure.
+         * End-of-line: disable camera triggering.
          */
-        items.push(simple_item(
-            seq,
-            MAV_CMD_DO_SET_CAM_TRIGG_DIST,
-            MAV_FRAME_MISSION,
-            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        ));
-        seq += 1;
+        if is_survey {
+            items.push(simple_item(
+                seq,
+                MAV_CMD_DO_SET_CAM_TRIGG_DIST,
+                MAV_FRAME_MISSION,
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ));
+            seq += 1;
+        }
     }
 
     json!({

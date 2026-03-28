@@ -21,19 +21,28 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use irontrack::ai::{ClaudeClient, NlPlanParams};
 use irontrack::dem::DemType;
 use irontrack::dem::ElevationSource::{CopernicusDem, OceanFallback, SeaLevelFallback};
 use irontrack::dem::TerrainEngine;
 use irontrack::error::DemError;
 use irontrack::gpkg::GeoPackage;
-use irontrack::io::{parse_boundary, write_dji_kmz, write_geojson, write_qgc_plan};
+use irontrack::io::{
+    parse_boundary, parse_centerline, write_dji_kmz, write_geojson, write_qgc_plan,
+};
 use irontrack::legal;
+use irontrack::math::dubins::TurnParams;
+use irontrack::math::routing::optimize_route;
+use irontrack::photogrammetry::corridor::{generate_corridor_lines, CorridorParams};
 use irontrack::photogrammetry::flightlines::{
-    adjust_for_terrain, clip_to_polygon, generate_flight_lines, generate_lidar_flight_lines,
-    validate_overlap, BoundingBox, FlightPlan, FlightPlanParams, LidarPlanParams,
+    adjust_for_terrain, clip_to_polygon, connect_with_turns, generate_flight_lines,
+    generate_lidar_flight_lines, validate_overlap, BoundingBox, FlightPlan, FlightPlanParams,
+    LidarPlanParams,
 };
 use irontrack::photogrammetry::lidar::LidarSensorParams;
-use irontrack::types::{AltitudeDatum, SensorParams};
+use irontrack::types::{AltitudeDatum, FlightLine, SensorParams};
+
+use geographiclib_rs::InverseGeodesic;
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -174,6 +183,51 @@ enum Commands {
         #[arg(long, value_name = "PTS")]
         target_density: Option<f64>,
 
+        // --- Corridor -------------------------------------------------------
+        /// Planning mode: area (default) or corridor.
+        /// Corridor mode generates flight lines following a KML centerline
+        /// polyline instead of filling a bounding box.
+        #[arg(long, default_value = "area", value_name = "MODE")]
+        mode: String,
+
+        /// KML/KMZ centerline file for corridor mode (LineString geometry).
+        #[arg(long, value_name = "PATH")]
+        centerline: Option<PathBuf>,
+
+        /// Total corridor width in metres (corridor mode only).
+        #[arg(long, value_name = "METRES")]
+        corridor_width: Option<f64>,
+
+        /// Number of parallel flight lines: 1, 3, or 5 (corridor mode only).
+        #[arg(long, value_name = "N")]
+        corridor_passes: Option<u8>,
+
+        // --- Turns ----------------------------------------------------------
+        /// Maximum bank angle during procedure turns in degrees.
+        /// Higher angles produce tighter turns but increase structural load
+        /// and tilt the sensor away from nadir.
+        #[arg(long, default_value = "20.0", value_name = "DEG")]
+        max_bank_angle: f64,
+
+        /// True airspeed for turn radius computation in m/s.
+        /// Default is a typical survey cruise speed.
+        #[arg(long, default_value = "30.0", value_name = "M/S")]
+        turn_airspeed: f64,
+
+        // --- Route optimization ---------------------------------------------
+        /// Enable TSP route optimization to minimize repositioning distance.
+        /// Reorders flight lines using nearest-neighbor + 2-opt heuristic.
+        #[arg(long)]
+        optimize_route: bool,
+
+        /// Launch point latitude in decimal degrees (for route optimization).
+        #[arg(long, value_name = "DEG")]
+        launch_lat: Option<f64>,
+
+        /// Launch point longitude in decimal degrees (for route optimization).
+        #[arg(long, value_name = "DEG")]
+        launch_lon: Option<f64>,
+
         // --- Terrain --------------------------------------------------------
         /// Run terrain-aware validation and altitude adjustment using cached
         /// Copernicus DEM tiles. If a required tile is not in the local cache
@@ -204,6 +258,66 @@ enum Commands {
         /// Altitudes are automatically converted to EGM96 as required by DJI.
         #[arg(long, value_name = "PATH")]
         dji_kmz: Option<PathBuf>,
+    },
+
+    /// Start the IronTrack FMS daemon (Axum server).
+    ///
+    /// Provides a REST API for mission planning and telemetry.
+    Daemon {
+        /// TCP port to listen on.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Enable mock telemetry mode.
+        #[arg(long)]
+        mock_telemetry: bool,
+
+        /// Speed for mock telemetry (m/s).
+        #[arg(long, default_value = "15.0")]
+        mock_speed: f64,
+
+        /// USB Vendor ID for GNSS receiver.
+        #[arg(long, default_value = "5446")] // 0x1546 (u-blox)
+        gnss_vid: u16,
+
+        /// USB Product ID for GNSS receiver.
+        #[arg(long, default_value = "425")] // 0x01A9
+        gnss_pid: u16,
+    },
+
+    /// Ask a question about IronTrack, aerial survey, or photogrammetry.
+    ///
+    /// Uses the Claude API (requires ANTHROPIC_API_KEY environment variable).
+    ///
+    /// Example:
+    ///
+    ///   irontrack ask What GSD do I need for 1:500 mapping?
+    Ask {
+        /// Your question (free-form text).
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        question: Vec<String>,
+    },
+
+    /// Convert a natural language mission description into flight plan parameters.
+    ///
+    /// The AI extracts structured parameters from your description and prints
+    /// the equivalent `irontrack plan` command. Add --execute to run it directly.
+    ///
+    /// Requires ANTHROPIC_API_KEY environment variable.
+    ///
+    /// Example:
+    ///
+    ///   irontrack nlplan Survey a 100m x 200m area at 51.5N 0.1W with 3cm GSD using a Phantom 4 Pro
+    NlPlan {
+        /// Mission description in plain English.
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        description: Vec<String>,
+        /// Execute the generated plan command immediately instead of just printing it.
+        #[arg(long)]
+        execute: bool,
+        /// GeoPackage output path (required when --execute is used).
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -237,6 +351,15 @@ fn main() {
             lidar_scan_rate,
             lidar_fov,
             target_density,
+            mode,
+            centerline,
+            corridor_width,
+            corridor_passes,
+            max_bank_angle,
+            turn_airspeed,
+            optimize_route,
+            launch_lat,
+            launch_lon,
             terrain,
             datum,
             output,
@@ -265,6 +388,15 @@ fn main() {
             lidar_scan_rate,
             lidar_fov,
             target_density,
+            mode,
+            centerline,
+            corridor_width,
+            corridor_passes,
+            max_bank_angle,
+            turn_airspeed,
+            optimize_route,
+            launch_lat,
+            launch_lon,
             terrain,
             datum,
             output,
@@ -272,6 +404,19 @@ fn main() {
             qgc_plan,
             dji_kmz,
         }),
+        Some(Commands::Daemon {
+            port,
+            mock_telemetry,
+            mock_speed,
+            gnss_vid,
+            gnss_pid,
+        }) => run_daemon(port, mock_telemetry, mock_speed, gnss_vid, gnss_pid),
+        Some(Commands::Ask { question }) => run_ask(question.join(" ")),
+        Some(Commands::NlPlan {
+            description,
+            execute,
+            output,
+        }) => run_nl_plan(description.join(" "), execute, output),
         None => {
             println!("IronTrack v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -281,6 +426,27 @@ fn main() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: daemon
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn run_daemon(
+    port: u16,
+    mock_telemetry: bool,
+    mock_speed: f64,
+    gnss_vid: u16,
+    gnss_pid: u16,
+) -> Result<()> {
+    let mock = if mock_telemetry {
+        Some(mock_speed)
+    } else {
+        None
+    };
+    irontrack::network::server::run_server(port, mock, gnss_vid, gnss_pid).await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +530,15 @@ struct PlanArgs {
     lidar_scan_rate: Option<f64>,
     lidar_fov: Option<f64>,
     target_density: Option<f64>,
+    mode: String,
+    centerline: Option<PathBuf>,
+    corridor_width: Option<f64>,
+    corridor_passes: Option<u8>,
+    max_bank_angle: f64,
+    turn_airspeed: f64,
+    optimize_route: bool,
+    launch_lat: Option<f64>,
+    launch_lon: Option<f64>,
     terrain: bool,
     datum: String,
     output: PathBuf,
@@ -382,6 +557,26 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         "agl" => AltitudeDatum::Agl,
         other => bail!("unknown datum {other:?}. Choose: egm2008, egm96, ellipsoidal, agl."),
     };
+
+    // --- Validate mode and mission type --------------------------------------
+
+    let mode_lower = args.mode.to_lowercase();
+    match mode_lower.as_str() {
+        "area" | "corridor" => {}
+        other => bail!("unknown --mode {other:?}. Choose: area, corridor."),
+    }
+
+    let mission_lower = args.mission_type.to_lowercase();
+    match mission_lower.as_str() {
+        "camera" | "lidar" => {}
+        other => bail!("unknown --mission-type {other:?}. Choose: camera, lidar."),
+    }
+
+    // --- Corridor mode (early return) ---------------------------------------
+
+    if mode_lower == "corridor" {
+        return run_corridor_plan(&args, target_datum);
+    }
 
     // --- Resolve boundary (bbox or KML polygon) ----------------------------
 
@@ -439,7 +634,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 
     // --- Resolve mission type and generate flight lines --------------------
 
-    let is_lidar = args.mission_type.to_lowercase() == "lidar";
+    let is_lidar = mission_lower == "lidar";
 
     let (plan, params) = if is_lidar {
         /*
@@ -559,6 +754,54 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         bbox.max_lat,
         bbox.max_lon,
     );
+
+    // --- Route optimization (optional) ------------------------------------
+
+    let plan = if args.optimize_route && plan.lines.len() >= 2 {
+        let launch_lat = args.launch_lat.unwrap_or(bbox.min_lat);
+        let launch_lon = args.launch_lon.unwrap_or(bbox.min_lon);
+        let result = optimize_route(&plan.lines, launch_lat, launch_lon);
+        println!(
+            "Route optimized: {:.0} m repositioning ({} lines reordered)",
+            result.total_reposition_m,
+            result.order.len()
+        );
+
+        let mut reordered = Vec::with_capacity(plan.lines.len());
+        for (idx, &line_idx) in result.order.iter().enumerate() {
+            if result.reversed[idx] {
+                let orig = &plan.lines[line_idx];
+                let mut rev = FlightLine::new().with_datum(orig.altitude_datum);
+                for i in (0..orig.len()).rev() {
+                    rev.push(orig.lats()[i], orig.lons()[i], orig.elevations()[i]);
+                }
+                reordered.push(rev);
+            } else {
+                reordered.push(plan.lines[line_idx].clone());
+            }
+        }
+        FlightPlan {
+            params: plan.params,
+            azimuth_deg: plan.azimuth_deg,
+            lines: reordered,
+        }
+    } else {
+        plan
+    };
+
+    // --- Connect flight lines with Dubins turns ---------------------------
+
+    let plan = if !is_lidar && plan.lines.len() >= 2 {
+        let turn_params = validate_turn_params(args.turn_airspeed, args.max_bank_angle)?;
+        let r = turn_params.min_radius();
+        println!(
+            "Turn radius: {:.0} m (V={:.0} m/s, bank={:.0}°)",
+            r, args.turn_airspeed, args.max_bank_angle
+        );
+        connect_with_turns(plan, &turn_params)
+    } else {
+        plan
+    };
 
     // --- Terrain-aware validation and adjustment (optional) ----------------
 
@@ -896,6 +1139,349 @@ fn apply_terrain_adjustment(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Corridor plan execution
+// ---------------------------------------------------------------------------
+
+/// Execute a corridor survey plan.
+///
+/// Parses the centerline KML, generates offset flight lines, and exports
+/// to the same output formats as area plans.
+fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()> {
+    if args.mission_type.to_lowercase() == "lidar" {
+        bail!(
+            "corridor mode does not support LiDAR missions. \
+             Use --mission-type camera (default) with --mode corridor."
+        );
+    }
+
+    let centerline_path = args
+        .centerline
+        .as_ref()
+        .context("--centerline is required for corridor mode")?;
+    let corridor_width = args
+        .corridor_width
+        .context("--corridor-width is required for corridor mode")?;
+    let corridor_passes = args.corridor_passes.unwrap_or(3);
+
+    // --- Parse centerline from KML ----------------------------------------
+
+    let linestrings = parse_centerline(centerline_path)
+        .with_context(|| format!("cannot parse centerline file {}", centerline_path.display()))?;
+    if linestrings.is_empty() {
+        bail!("centerline file contains no LineString elements");
+    }
+    let centerline = &linestrings[0];
+
+    // --- Resolve sensor and compute waypoint interval ----------------------
+
+    let sensor_params = resolve_sensor(args)?;
+    let gsd_m = args.gsd_cm / 100.0;
+    let params = FlightPlanParams::new(sensor_params, gsd_m)
+        .context("invalid sensor or GSD")?
+        .with_side_lap(args.side_lap)
+        .context("invalid side-lap value")?
+        .with_end_lap(args.end_lap)
+        .context("invalid end-lap value")?;
+
+    let waypoint_interval = params.photo_interval();
+
+    /*
+     * Match the area-path datum semantics: explicit --altitude-msl means
+     * the altitude is orthometric MSL (tag EGM2008); otherwise the sensor-
+     * derived AGL is used (tag Agl).
+     */
+    let (flight_alt_m, line_datum) = match args.altitude_msl {
+        Some(msl) => (msl, AltitudeDatum::Egm2008),
+        None => (params.nominal_agl(), AltitudeDatum::Agl),
+    };
+
+    // --- Generate corridor flight lines ------------------------------------
+
+    let corridor_params = CorridorParams {
+        centerline: centerline.clone(),
+        buffer_width: corridor_width,
+        num_passes: corridor_passes,
+    };
+
+    let lines = generate_corridor_lines(
+        &corridor_params,
+        waypoint_interval,
+        flight_alt_m,
+        line_datum,
+    )
+    .context("corridor flight line generation failed")?;
+
+    /*
+     * Compute the reference azimuth from the first segment of the centerline
+     * (for metadata purposes — corridor lines follow the polyline, not a
+     * fixed azimuth).
+     */
+    let azimuth_deg = if centerline.len() >= 2 {
+        let (lat1, lon1) = centerline[0];
+        let (lat2, lon2) = centerline[1];
+        let geod = geographiclib_rs::Geodesic::wgs84();
+        let (_, azi1, _) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
+        ((azi1 % 360.0) + 360.0) % 360.0
+    } else {
+        0.0
+    };
+
+    let plan = FlightPlan {
+        params: params.clone(),
+        azimuth_deg,
+        lines,
+    };
+
+    let total_pts: usize = plan.lines.iter().map(|l| l.len()).sum();
+    println!(
+        "Corridor: {} flight line(s), {} waypoints, {:.0} m width, {} passes",
+        plan.lines.len(),
+        total_pts,
+        corridor_width,
+        corridor_passes,
+    );
+
+    // --- Route optimization (optional) ------------------------------------
+
+    let plan = if args.optimize_route && plan.lines.len() >= 2 {
+        let launch_lat = args
+            .launch_lat
+            .unwrap_or_else(|| corridor_params.centerline[0].0);
+        let launch_lon = args
+            .launch_lon
+            .unwrap_or_else(|| corridor_params.centerline[0].1);
+        let result = optimize_route(&plan.lines, launch_lat, launch_lon);
+        println!(
+            "Route optimized: {:.0} m repositioning ({} lines reordered)",
+            result.total_reposition_m,
+            result.order.len()
+        );
+
+        let mut reordered = Vec::with_capacity(plan.lines.len());
+        for (idx, &line_idx) in result.order.iter().enumerate() {
+            if result.reversed[idx] {
+                let orig = &plan.lines[line_idx];
+                let mut rev = FlightLine::new().with_datum(orig.altitude_datum);
+                for i in (0..orig.len()).rev() {
+                    rev.push(orig.lats()[i], orig.lons()[i], orig.elevations()[i]);
+                }
+                reordered.push(rev);
+            } else {
+                reordered.push(plan.lines[line_idx].clone());
+            }
+        }
+        FlightPlan {
+            params: plan.params,
+            azimuth_deg: plan.azimuth_deg,
+            lines: reordered,
+        }
+    } else {
+        plan
+    };
+
+    // --- Connect corridor lines with Dubins turns -------------------------
+
+    let mut plan = if plan.lines.len() >= 2 {
+        let turn_params = validate_turn_params(args.turn_airspeed, args.max_bank_angle)?;
+        let r = turn_params.min_radius();
+        println!(
+            "Turn radius: {:.0} m (V={:.0} m/s, bank={:.0}°)",
+            r, args.turn_airspeed, args.max_bank_angle
+        );
+        connect_with_turns(plan, &turn_params)
+    } else {
+        plan
+    };
+
+    // --- Terrain-aware adjustment (optional) -------------------------------
+
+    let engine = if args.terrain {
+        match apply_terrain_adjustment(
+            FlightPlan {
+                params: plan.params.clone(),
+                azimuth_deg: plan.azimuth_deg,
+                lines: plan.lines.clone(),
+            },
+            &plan.params,
+        ) {
+            Ok((adjusted, eng)) => {
+                plan = adjusted;
+                eng
+            }
+            Err(e) => {
+                eprintln!("[Warning] Terrain adjustment failed: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // --- DSM safety warning ------------------------------------------------
+
+    let agl_datum_conversion_uses_dem = plan.lines.iter().any(|l| l.altitude_datum != target_datum)
+        && (target_datum == AltitudeDatum::Agl
+            || plan
+                .lines
+                .iter()
+                .any(|l| l.altitude_datum == AltitudeDatum::Agl));
+
+    let dsm_warning: Option<&str> = if engine
+        .as_ref()
+        .is_some_and(|e| e.dem_type() == DemType::Dsm)
+        || agl_datum_conversion_uses_dem
+    {
+        Some(legal::DSM_WARNING_TEXT)
+    } else {
+        None
+    };
+
+    // --- Convert to target vertical datum ----------------------------------
+
+    if plan.lines.iter().any(|l| l.altitude_datum != target_datum) {
+        let engine = match engine {
+            Some(e) => e,
+            None => TerrainEngine::new()
+                .context("cannot initialise terrain engine for datum conversion")?,
+        };
+        let mut converted_lines = Vec::with_capacity(plan.lines.len());
+        for line in &plan.lines {
+            converted_lines.push(line.to_datum(target_datum, &engine)?);
+        }
+        plan.lines = converted_lines;
+        println!("Altitude datum conversion: applied (target: {target_datum}).");
+    }
+
+    // --- Copernicus attribution -------------------------------------------
+
+    let attribution_string = legal::copernicus_attribution_default();
+    let (attribution, disclaimer): (Option<&str>, Option<&str>) = if dsm_warning.is_some() {
+        (
+            Some(attribution_string.as_str()),
+            Some(legal::COPERNICUS_DISCLAIMER),
+        )
+    } else {
+        (None, None)
+    };
+
+    // --- Export to GeoPackage ----------------------------------------------
+
+    let gpkg = GeoPackage::new(&args.output)
+        .with_context(|| format!("cannot create GeoPackage at {}", args.output.display()))?;
+    gpkg.create_feature_table("flight_lines")
+        .context("failed to create flight_lines feature table")?;
+    gpkg.insert_flight_plan("flight_lines", &plan)
+        .context("failed to insert flight plan into GeoPackage")?;
+
+    if let Some(warning) = dsm_warning {
+        gpkg.upsert_metadata("safety_dsm_warning", warning)
+            .context("failed to write DSM warning to GeoPackage metadata")?;
+        gpkg.append_content_description("flight_lines", &format!("; {warning}"))
+            .context("failed to append DSM warning to gpkg_contents description")?;
+        gpkg.upsert_metadata("copernicus_attribution", &attribution_string)
+            .context("failed to write Copernicus attribution to GeoPackage metadata")?;
+        gpkg.upsert_metadata("copernicus_disclaimer", legal::COPERNICUS_DISCLAIMER)
+            .context("failed to write Copernicus disclaimer to GeoPackage metadata")?;
+    }
+
+    println!("GeoPackage written: {}", args.output.display());
+
+    // --- Export to GeoJSON (optional) --------------------------------------
+
+    if let Some(geojson_path) = &args.geojson {
+        write_geojson(geojson_path, &plan, dsm_warning, attribution, disclaimer)
+            .with_context(|| format!("cannot write GeoJSON to {}", geojson_path.display()))?;
+        println!("GeoJSON written:    {}", geojson_path.display());
+    }
+
+    // --- Export to QGroundControl .plan (optional) -------------------------
+
+    if let Some(qgc_path) = &args.qgc_plan {
+        let trigger_dist = params.photo_interval();
+        let qgc_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+
+        let needs_conversion =
+            qgc_datum != AltitudeDatum::Agl && qgc_datum != AltitudeDatum::Wgs84Ellipsoidal;
+
+        let qgc_lines: Option<Vec<_>> = if needs_conversion {
+            let engine = TerrainEngine::new()
+                .context("cannot initialise terrain engine for QGC datum conversion")?;
+            let mut converted = Vec::with_capacity(plan.lines.len());
+            for line in &plan.lines {
+                converted.push(
+                    line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+                        .context("QGC datum conversion to WGS84 ellipsoidal failed")?,
+                );
+            }
+            Some(converted)
+        } else {
+            None
+        };
+
+        let qgc_plan = FlightPlan {
+            params: plan.params.clone(),
+            azimuth_deg: plan.azimuth_deg,
+            lines: qgc_lines.unwrap_or_else(|| plan.lines.clone()),
+        };
+
+        write_qgc_plan(qgc_path, &qgc_plan, trigger_dist)
+            .with_context(|| format!("cannot write QGC plan to {}", qgc_path.display()))?;
+        println!("QGC plan written:   {}", qgc_path.display());
+    }
+
+    // --- Export to DJI .kmz (optional) ------------------------------------
+
+    if let Some(dji_path) = &args.dji_kmz {
+        let dji_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+
+        let dji_plan = if dji_datum != AltitudeDatum::Egm96 {
+            let engine = TerrainEngine::new()
+                .context("cannot initialise terrain engine for DJI datum conversion")?;
+            let mut converted = Vec::with_capacity(plan.lines.len());
+            for line in &plan.lines {
+                converted.push(
+                    line.to_datum(AltitudeDatum::Egm96, &engine)
+                        .context("DJI datum conversion to EGM96 failed")?,
+                );
+            }
+            FlightPlan {
+                params: plan.params.clone(),
+                azimuth_deg: plan.azimuth_deg,
+                lines: converted,
+            }
+        } else {
+            FlightPlan {
+                params: plan.params.clone(),
+                azimuth_deg: plan.azimuth_deg,
+                lines: plan.lines.clone(),
+            }
+        };
+
+        write_dji_kmz(dji_path, &dji_plan)
+            .with_context(|| format!("cannot write DJI KMZ to {}", dji_path.display()))?;
+        println!("DJI KMZ written:    {} (datum: EGM96)", dji_path.display());
+    }
+
+    // --- Print summary and warnings ----------------------------------------
+
+    if dsm_warning.is_some() {
+        legal::print_copernicus_attribution();
+        let _ = std::io::stdout().flush();
+        legal::print_dsm_warning();
+    }
+
+    Ok(())
+}
+
 /// Print a human-readable mission summary to stdout.
 fn print_summary(plan: &FlightPlan, params: &FlightPlanParams, gsd_cm: f64, sensor_name: &str) {
     let nominal_agl = params.nominal_agl();
@@ -959,6 +1545,19 @@ fn print_summary(plan: &FlightPlan, params: &FlightPlanParams, gsd_cm: f64, sens
 
 /// Built-in sensor presets. Specs sourced from manufacturer datasheets.
 ///
+/// Validate turn parameters and return a `TurnParams` instance.
+///
+/// Prevents NaN/infinite turn radii from invalid bank angles or airspeeds.
+fn validate_turn_params(airspeed: f64, bank_angle: f64) -> Result<TurnParams> {
+    if airspeed <= 0.0 || !airspeed.is_finite() {
+        bail!("--turn-airspeed must be positive, got {airspeed}");
+    }
+    if bank_angle <= 0.0 || bank_angle >= 60.0 || !bank_angle.is_finite() {
+        bail!("--max-bank-angle must be in (0, 60) degrees, got {bank_angle}");
+    }
+    Ok(TurnParams::new(airspeed, bank_angle))
+}
+
 /// All values are for the primary RGB camera at the widest standard focal
 /// length unless otherwise noted.
 fn resolve_sensor(args: &PlanArgs) -> Result<SensorParams> {
@@ -1012,4 +1611,207 @@ fn resolve_sensor(args: &PlanArgs) -> Result<SensorParams> {
         ),
     }
     .map_err(|e| anyhow::anyhow!(e))
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: ask
+// ---------------------------------------------------------------------------
+
+fn run_ask(question: String) -> Result<()> {
+    if question.trim().is_empty() {
+        bail!("please provide a question");
+    }
+    let client = ClaudeClient::from_env().context("cannot initialise Claude API client")?;
+    let answer = client
+        .send(Some(irontrack::ai::prompts::ASK_SYSTEM_PROMPT), &question)
+        .context("Claude API request failed")?;
+    println!("{answer}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Subcommand: nlplan
+// ---------------------------------------------------------------------------
+
+fn run_nl_plan(description: String, execute: bool, output: Option<PathBuf>) -> Result<()> {
+    if description.trim().is_empty() {
+        bail!("please provide a mission description");
+    }
+    let client = ClaudeClient::from_env().context("cannot initialise Claude API client")?;
+
+    eprintln!("Extracting flight plan parameters from description...");
+    let params = client
+        .extract_plan_params(&description)
+        .context("parameter extraction failed")?;
+
+    print_nl_plan_command(&params);
+
+    if execute {
+        let output_path = output.context("--output is required when using --execute")?;
+        let plan_args = nl_params_to_plan_args(params, output_path)?;
+        run_plan(plan_args)
+    } else {
+        Ok(())
+    }
+}
+
+/// Print the equivalent `irontrack plan` CLI command so the user can see
+/// exactly what parameters were extracted.
+fn print_nl_plan_command(p: &NlPlanParams) {
+    let mut cmd = String::from("irontrack plan");
+
+    if let Some(lat) = p.min_lat {
+        cmd += &format!(" --min-lat {lat}");
+    }
+    if let Some(lon) = p.min_lon {
+        cmd += &format!(" --min-lon {lon}");
+    }
+    if let Some(lat) = p.max_lat {
+        cmd += &format!(" --max-lat {lat}");
+    }
+    if let Some(lon) = p.max_lon {
+        cmd += &format!(" --max-lon {lon}");
+    }
+    if let Some(ref s) = p.sensor {
+        cmd += &format!(" --sensor {s}");
+    }
+    if let Some(g) = p.gsd_cm {
+        cmd += &format!(" --gsd-cm {g}");
+    }
+    if let Some(s) = p.side_lap {
+        cmd += &format!(" --side-lap {s}");
+    }
+    if let Some(e) = p.end_lap {
+        cmd += &format!(" --end-lap {e}");
+    }
+    if let Some(a) = p.azimuth {
+        cmd += &format!(" --azimuth {a}");
+    }
+    if p.terrain.unwrap_or(false) {
+        cmd += " --terrain";
+    }
+    if let Some(ref mt) = p.mission_type {
+        if mt != "camera" {
+            cmd += &format!(" --mission-type {mt}");
+        }
+    }
+    if let Some(alt) = p.altitude_msl {
+        cmd += &format!(" --altitude-msl {alt}");
+    }
+    if let Some(ref d) = p.datum {
+        if d != "egm2008" {
+            cmd += &format!(" --datum {d}");
+        }
+    }
+    // Custom sensor fields
+    if let Some(fl) = p.focal_length_mm {
+        cmd += &format!(" --focal-length-mm {fl}");
+    }
+    if let Some(sw) = p.sensor_width_mm {
+        cmd += &format!(" --sensor-width-mm {sw}");
+    }
+    if let Some(sh) = p.sensor_height_mm {
+        cmd += &format!(" --sensor-height-mm {sh}");
+    }
+    if let Some(iw) = p.image_width_px {
+        cmd += &format!(" --image-width-px {iw}");
+    }
+    if let Some(ih) = p.image_height_px {
+        cmd += &format!(" --image-height-px {ih}");
+    }
+    // LiDAR fields
+    if let Some(prr) = p.lidar_prr {
+        cmd += &format!(" --lidar-prr {prr}");
+    }
+    if let Some(sr) = p.lidar_scan_rate {
+        cmd += &format!(" --lidar-scan-rate {sr}");
+    }
+    if let Some(fov) = p.lidar_fov {
+        cmd += &format!(" --lidar-fov {fov}");
+    }
+    if let Some(td) = p.target_density {
+        cmd += &format!(" --target-density {td}");
+    }
+
+    cmd += " --output <OUTPUT.gpkg>";
+
+    println!("\nEquivalent command:\n  {cmd}\n");
+}
+
+/// Convert AI-extracted parameters into the PlanArgs struct used by run_plan().
+///
+/// Validates mission_type, sensor preset, and datum to prevent LLM
+/// hallucinations from silently producing an incorrect plan.
+fn nl_params_to_plan_args(p: NlPlanParams, output: PathBuf) -> Result<PlanArgs> {
+    let min_lat = p.min_lat.context("AI did not provide min_lat")?;
+    let min_lon = p.min_lon.context("AI did not provide min_lon")?;
+    let max_lat = p.max_lat.context("AI did not provide max_lat")?;
+    let max_lon = p.max_lon.context("AI did not provide max_lon")?;
+
+    let mission_type = p.mission_type.unwrap_or_else(|| "camera".into());
+    match mission_type.to_lowercase().as_str() {
+        "camera" | "lidar" => {}
+        other => {
+            bail!("AI returned invalid mission_type {other:?}. Expected \"camera\" or \"lidar\".")
+        }
+    }
+
+    let sensor = p.sensor.unwrap_or_else(|| "phantom4pro".into());
+    if sensor != "custom" && p.focal_length_mm.is_none() {
+        match sensor.as_str() {
+            "phantom4pro" | "mavic3" | "ixm100" => {}
+            other => bail!(
+                "AI returned unknown sensor preset {other:?}. \
+                 Expected: phantom4pro, mavic3, ixm100, or custom."
+            ),
+        }
+    }
+
+    let datum = p.datum.unwrap_or_else(|| "egm2008".into());
+    match datum.to_lowercase().as_str() {
+        "egm2008" | "egm96" | "ellipsoidal" | "wgs84" | "agl" => {}
+        other => bail!(
+            "AI returned unknown datum {other:?}. \
+             Expected: egm2008, egm96, ellipsoidal, agl."
+        ),
+    }
+
+    Ok(PlanArgs {
+        min_lat,
+        min_lon,
+        max_lat,
+        max_lon,
+        boundary: None,
+        sensor,
+        focal_length_mm: p.focal_length_mm,
+        sensor_width_mm: p.sensor_width_mm,
+        sensor_height_mm: p.sensor_height_mm,
+        image_width_px: p.image_width_px,
+        image_height_px: p.image_height_px,
+        gsd_cm: p.gsd_cm.unwrap_or(5.0),
+        side_lap: p.side_lap.unwrap_or(60.0),
+        end_lap: p.end_lap.unwrap_or(80.0),
+        azimuth: p.azimuth.unwrap_or(0.0),
+        altitude_msl: p.altitude_msl,
+        mission_type,
+        lidar_prr: p.lidar_prr,
+        lidar_scan_rate: p.lidar_scan_rate,
+        lidar_fov: p.lidar_fov,
+        target_density: p.target_density,
+        mode: "area".into(),
+        centerline: None,
+        corridor_width: None,
+        corridor_passes: None,
+        max_bank_angle: 20.0,
+        turn_airspeed: 30.0,
+        optimize_route: false,
+        launch_lat: None,
+        launch_lon: None,
+        terrain: p.terrain.unwrap_or(false),
+        datum,
+        output,
+        geojson: None,
+        qgc_plan: None,
+        dji_kmz: None,
+    })
 }

@@ -32,11 +32,15 @@
  * DEM-aware dynamic AGL adjustment is planned for Milestone 2C.
  */
 
+use std::f64::consts::PI;
+
 use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic};
 use rayon::prelude::*;
 
 use crate::dem::TerrainEngine;
 use crate::error::{DemError, PhotogrammetryError};
+use crate::math::dubins::TurnParams;
+use crate::math::numerics::KahanAccumulator;
 use crate::photogrammetry::lidar::{self, LidarSensorParams};
 use crate::types::{AltitudeDatum, FlightLine, SensorParams};
 
@@ -317,6 +321,7 @@ pub enum MissionType {
 ///    export gate.
 ///
 /// Construct via [`generate_flight_lines`].
+#[derive(Clone)]
 pub struct FlightPlan {
     /// Mission and sensor parameters used to generate this plan.
     pub params: FlightPlanParams,
@@ -547,18 +552,14 @@ fn generate_grid(
                 geod.direct(orig_lat, orig_lon, azimuth_deg, along_min);
 
             let mut line = FlightLine::new().with_datum(datum);
-            let mut kahan_sum = 0.0_f64;
-            let mut kahan_c = 0.0_f64;
+            let mut along_track = KahanAccumulator::new();
 
             for j in 0..n_waypoints {
                 let (wp_lat, wp_lon): (f64, f64) =
-                    geod.direct(start_lat, start_lon, azimuth_deg, kahan_sum);
+                    geod.direct(start_lat, start_lon, azimuth_deg, along_track.total());
                 line.push(wp_lat.to_radians(), wp_lon.to_radians(), flight_alt_m);
                 if j + 1 < n_waypoints {
-                    let y = waypoint_interval - kahan_c;
-                    let t = kahan_sum + y;
-                    kahan_c = (t - kahan_sum) - y;
-                    kahan_sum = t;
+                    along_track.add(waypoint_interval);
                 }
             }
 
@@ -576,6 +577,307 @@ fn normalize_azimuth(deg: f64) -> f64 {
         a + 360.0
     } else {
         a
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dubins turn connections (Phase 5B)
+// ---------------------------------------------------------------------------
+
+/// Connect adjacent flight lines with Dubins procedure turns.
+///
+/// After generating parallel flight lines, this function inserts turn paths
+/// between adjacent line endpoints to produce a single continuous mission
+/// polyline (line -> turn -> line -> turn -> ...).
+///
+/// The turn direction (teardrop vs bowtie) is chosen by testing both
+/// endpoint connection options and selecting the one that minimises total
+/// path length.
+///
+/// During turns, the altitude is held constant at the lower of the two
+/// connected line endpoints. The aircraft is off the survey grid during
+/// turns, so terrain data may not be available.
+///
+/// Returns a new `FlightPlan` whose `lines` vector interleaves survey
+/// legs with turn segments: [leg0, turn0, leg1, turn1, ...]. Survey legs
+/// retain their original boundaries so that autopilot exporters can
+/// bracket camera triggering correctly (QGC `DO_SET_CAM_TRIGG_DIST`,
+/// DJI `actionGroup` per line). Turn segments have no camera actions.
+pub fn connect_with_turns(plan: FlightPlan, turn_params: &TurnParams) -> FlightPlan {
+    use crate::geodesy::utm::{utm_to_wgs84, utm_zone, wgs84_to_utm_in_zone};
+    use crate::math::dubins::{dubins_path, Pose};
+    use crate::types::{GeoCoord, Hemisphere, UtmCoord};
+
+    if plan.lines.len() < 2 {
+        return plan;
+    }
+
+    let geod = Geodesic::wgs84();
+
+    /*
+     * Determine a common UTM zone from the centroid of all line endpoints
+     * so that Dubins geometry operates in a consistent Euclidean frame.
+     */
+    let (sum_lat, sum_lon, count) = plan
+        .lines
+        .iter()
+        .fold((0.0_f64, 0.0_f64, 0usize), |acc, l| {
+            if l.len() < 2 {
+                return acc;
+            }
+            let lats = l.lats();
+            let lons = l.lons();
+            (
+                acc.0 + lats[0].to_degrees() + lats[l.len() - 1].to_degrees(),
+                acc.1 + lons[0].to_degrees() + lons[l.len() - 1].to_degrees(),
+                acc.2 + 2,
+            )
+        });
+    if count == 0 {
+        return plan;
+    }
+    let centroid_lat = sum_lat / count as f64;
+    let centroid_lon = sum_lon / count as f64;
+
+    /*
+     * Reject plans that span the equator or antimeridian — the single-zone
+     * UTM projection would produce distorted turn geometry. These edge
+     * cases are extremely rare in practice (aerial surveys don't straddle
+     * the equator or dateline in a single flight).
+     */
+    let all_lats: Vec<f64> = plan
+        .lines
+        .iter()
+        .flat_map(|l| l.lats().iter().map(|r| r.to_degrees()))
+        .collect();
+    let has_north = all_lats.iter().any(|&lat| lat >= 0.0);
+    let has_south = all_lats.iter().any(|&lat| lat < 0.0);
+    if has_north && has_south {
+        eprintln!(
+            "[Warning] Flight plan spans the equator — skipping Dubins turn insertion \
+             (UTM hemisphere mismatch)."
+        );
+        return plan;
+    }
+
+    let all_lons: Vec<f64> = plan
+        .lines
+        .iter()
+        .flat_map(|l| l.lons().iter().map(|r| r.to_degrees()))
+        .collect();
+    let lon_range = all_lons.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        - all_lons.iter().cloned().fold(f64::INFINITY, f64::min);
+    if lon_range > 180.0 {
+        eprintln!("[Warning] Flight plan spans the antimeridian — skipping Dubins turn insertion.");
+        return plan;
+    }
+
+    let zone = utm_zone(centroid_lon);
+    let hemisphere = if centroid_lat >= 0.0 {
+        Hemisphere::North
+    } else {
+        Hemisphere::South
+    };
+
+    // Helper: project a radian lat/lon to UTM in the common zone.
+    let to_utm = |lat_rad: f64, lon_rad: f64| -> Option<(f64, f64)> {
+        let coord = GeoCoord::new(lat_rad, lon_rad, 0.0).ok()?;
+        let utm = wgs84_to_utm_in_zone(coord, zone, hemisphere).ok()?;
+        Some((utm.easting, utm.northing))
+    };
+
+    // Helper: convert UTM back to radian lat/lon.
+    let from_utm = |easting: f64, northing: f64| -> Option<(f64, f64)> {
+        let utm = UtmCoord {
+            easting,
+            northing,
+            zone,
+            hemisphere,
+        };
+        let (lat_deg, lon_deg) = utm_to_wgs84(&utm).ok()?;
+        let coord = GeoCoord::from_degrees(lat_deg, lon_deg, 0.0).ok()?;
+        Some((coord.lat_rad(), coord.lon_rad()))
+    };
+
+    // Helper: compute heading (radians, math convention: CCW from +x) at a line endpoint.
+    let endpoint_heading = |line: &FlightLine, at_end: bool| -> f64 {
+        let n = line.len();
+        if n < 2 {
+            return 0.0;
+        }
+        let (i1, i2) = if at_end { (n - 2, n - 1) } else { (0, 1) };
+        let lat1 = line.lats()[i1].to_degrees();
+        let lon1 = line.lons()[i1].to_degrees();
+        let lat2 = line.lats()[i2].to_degrees();
+        let lon2 = line.lons()[i2].to_degrees();
+        let (_, azi1, _): (f64, f64, f64) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
+        // Convert geodesic azimuth (CW from north) to math angle (CCW from east).
+        azimuth_to_math(azi1)
+    };
+
+    let datum = plan.lines[0].altitude_datum;
+    let mut result_lines: Vec<FlightLine> = Vec::new();
+
+    // First survey leg (always in original order).
+    result_lines.push(plan.lines[0].clone());
+
+    for i in 1..plan.lines.len() {
+        let prev = result_lines.last().unwrap();
+        let next = &plan.lines[i];
+        if prev.len() < 2 || next.len() < 2 {
+            result_lines.push(next.clone());
+            continue;
+        }
+
+        /*
+         * Try both connection options:
+         *   Option A: prev_end -> next_start (normal order)
+         *   Option B: prev_end -> next_end (reversed next line)
+         * Select whichever produces the shorter Dubins path.
+         */
+        let prev_end_lat = prev.lats()[prev.len() - 1];
+        let prev_end_lon = prev.lons()[prev.len() - 1];
+        let prev_end_elev = prev.elevations()[prev.len() - 1];
+        let heading_out = endpoint_heading(prev, true);
+
+        let next_start_lat = next.lats()[0];
+        let next_start_lon = next.lons()[0];
+        let next_start_elev = next.elevations()[0];
+        let heading_in_a = endpoint_heading(next, false);
+
+        let next_end_lat = next.lats()[next.len() - 1];
+        let next_end_lon = next.lons()[next.len() - 1];
+        let next_end_elev = next.elevations()[next.len() - 1];
+        let heading_in_b = endpoint_heading(next, true) + PI;
+
+        let start_utm = to_utm(prev_end_lat, prev_end_lon);
+        let end_a_utm = to_utm(next_start_lat, next_start_lon);
+        let end_b_utm = to_utm(next_end_lat, next_end_lon);
+
+        if let (Some(s), Some(ea), Some(eb)) = (start_utm, end_a_utm, end_b_utm) {
+            let pose_start = Pose {
+                x: s.0,
+                y: s.1,
+                theta: heading_out,
+            };
+            let pose_a = Pose {
+                x: ea.0,
+                y: ea.1,
+                theta: heading_in_a,
+            };
+            let pose_b = Pose {
+                x: eb.0,
+                y: eb.1,
+                theta: heading_in_b,
+            };
+
+            let path_a = dubins_path(pose_start, pose_a, turn_params);
+            let path_b = dubins_path(pose_start, pose_b, turn_params);
+
+            let len_a: f64 = path_length(&path_a);
+            let len_b: f64 = path_length(&path_b);
+
+            /*
+             * Turn altitude = higher of the two connected endpoints.
+             * During turns the aircraft is off the survey grid where
+             * terrain data may not be loaded — holding the higher
+             * altitude is the conservative safety choice.
+             */
+            let (use_reverse, turn_alt, turn_pts) = if len_a <= len_b {
+                let alt = prev_end_elev.max(next_start_elev);
+                (false, alt, path_a)
+            } else {
+                let alt = prev_end_elev.max(next_end_elev);
+                (true, alt, path_b)
+            };
+
+            // Insert turn segment as a separate FlightLine (no camera trigger).
+            let mut turn_line = FlightLine::new().with_datum(datum);
+            turn_line.is_transit = true;
+            for &(ex, ny) in turn_pts.iter().skip(1) {
+                if let Some((lat_rad, lon_rad)) = from_utm(ex, ny) {
+                    turn_line.push(lat_rad, lon_rad, turn_alt);
+                } else {
+                    eprintln!(
+                        "[Warning] UTM inverse projection failed for turn waypoint — point dropped."
+                    );
+                }
+            }
+
+            /*
+             * Snap the last turn waypoint to the exact entry point of the
+             * next survey leg. This closes any gap caused by Dubins
+             * discretisation drift.
+             */
+            let next_leg_entry = if use_reverse {
+                (next.lats()[next.len() - 1], next.lons()[next.len() - 1])
+            } else {
+                (next.lats()[0], next.lons()[0])
+            };
+            if !turn_line.is_empty() {
+                // Replace last point with the exact leg entry.
+                let tl = turn_line.len();
+                let mut snapped = FlightLine::new().with_datum(datum);
+                snapped.is_transit = true;
+                for i in 0..tl - 1 {
+                    snapped.push(
+                        turn_line.lats()[i],
+                        turn_line.lons()[i],
+                        turn_line.elevations()[i],
+                    );
+                }
+                snapped.push(next_leg_entry.0, next_leg_entry.1, turn_alt);
+                result_lines.push(snapped);
+            }
+
+            // Append next survey leg (possibly reversed).
+            if use_reverse {
+                let mut rev = FlightLine::new().with_datum(datum);
+                append_line(&mut rev, next, true);
+                result_lines.push(rev);
+            } else {
+                result_lines.push(next.clone());
+            }
+        } else {
+            result_lines.push(next.clone());
+        }
+    }
+
+    FlightPlan {
+        params: plan.params,
+        azimuth_deg: plan.azimuth_deg,
+        lines: result_lines,
+    }
+}
+
+/// Convert a geodesic azimuth (degrees CW from north) to a math angle
+/// (radians CCW from +x axis / east).
+fn azimuth_to_math(azi_deg: f64) -> f64 {
+    (90.0 - azi_deg).to_radians()
+}
+
+/// Compute the total Euclidean path length of a point sequence.
+fn path_length(pts: &[(f64, f64)]) -> f64 {
+    pts.windows(2)
+        .map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt())
+        .sum()
+}
+
+/// Append all waypoints from a FlightLine to a result line.
+/// If `reverse` is true, append in reverse order.
+fn append_line(result: &mut FlightLine, line: &FlightLine, reverse: bool) {
+    let lats = line.lats();
+    let lons = line.lons();
+    let elevs = line.elevations();
+
+    if reverse {
+        for i in (0..line.len()).rev() {
+            result.push(lats[i], lons[i], elevs[i]);
+        }
+    } else {
+        for i in 0..line.len() {
+            result.push(lats[i], lons[i], elevs[i]);
+        }
     }
 }
 
@@ -1907,7 +2209,7 @@ mod tests {
             .unwrap()
             .with_end_lap(80.0)
             .unwrap();
-        let plan = generate_flight_lines(&bbox, 90.0, &params).unwrap();
+        let _plan = generate_flight_lines(&bbox, 90.0, &params).unwrap();
 
         /*
          * Polygon covers the southern half: lat in [51.49, 51.505].

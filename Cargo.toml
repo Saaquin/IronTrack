@@ -16,13 +16,22 @@ egm2008 = "0.1"
 geographiclib-rs = "0.2"
 byteorder = "1"
 dirs = "5"
-reqwest = { version = "0.12", features = ["blocking"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 tiff = "0.9"
 tempfile = "3"
 thiserror = "1"
 anyhow = "1"
 quick-xml = { version = "0.36", features = ["serialize"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures-util = "0.3"
+serialport = "4"
+tokio-serial = "5"
+mdns-sd = "0.13"
+nalgebra = "0.33"
 
 [patch.crates-io]
 egm96 = { path = "vendor/egm96" }
@@ -30,3 +39,4 @@ egm96 = { path = "vendor/egm96" }
 [dev-dependencies]
 approx = "0.5"
 flate2 = "1"
+tokio-tungstenite = "0.24"

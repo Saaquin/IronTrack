@@ -19,10 +19,13 @@
 // flight line generation, side-lap validation over variable DEM terrain,
 // and dynamic AGL adjustment.
 
+pub mod corridor;
 pub mod flightlines;
 pub mod lidar;
 pub mod sensor;
+pub use sensor::{presets, resolve_sensor};
 
+pub use corridor::{generate_corridor_lines, CorridorParams};
 pub use flightlines::FlightPlan;
 
 #[cfg(test)]

@@ -37,6 +37,8 @@ use serde_json::{json, Value};
 use crate::error::IoError;
 use crate::photogrammetry::FlightPlan;
 
+use crate::math::geometry::Polygon;
+
 /// Serialize `plan` to a RFC 7946 GeoJSON FeatureCollection and write it to
 /// `path`. Truncates and overwrites any existing file at that path.
 ///
@@ -60,6 +62,147 @@ pub fn write_geojson(
     let mut file = std::fs::File::create(path)?;
     file.write_all(&json_bytes)?;
     Ok(())
+}
+
+/// Parse a GeoJSON Value into a list of `Polygon` objects.
+/// Supports Polygon, MultiPolygon, Feature, and FeatureCollection.
+pub fn geojson_to_polygons(value: &Value) -> Vec<Polygon> {
+    let mut polygons = Vec::new();
+    process_geojson_value(value, &mut |geom| {
+        if let Some(poly) = parse_polygon(geom) {
+            polygons.push(poly);
+        } else if let Some(mut multi) = parse_multipolygon(geom) {
+            polygons.append(&mut multi);
+        }
+    });
+    polygons
+}
+
+/// Parse a GeoJSON Value into a list of `LineString` objects (Vec<(f64, f64)>).
+/// Supports LineString, MultiLineString, Feature, and FeatureCollection.
+pub fn geojson_to_linestrings(value: &Value) -> Vec<Vec<(f64, f64)>> {
+    let mut lines = Vec::new();
+    process_geojson_value(value, &mut |geom| {
+        if let Some(line) = parse_linestring(geom) {
+            lines.push(line);
+        } else if let Some(mut multi) = parse_multilinestring(geom) {
+            lines.append(&mut multi);
+        }
+    });
+    lines
+}
+
+fn process_geojson_value(value: &Value, cb: &mut dyn FnMut(&Value)) {
+    match value["type"].as_str() {
+        Some("FeatureCollection") => {
+            if let Some(features) = value["features"].as_array() {
+                for feature in features {
+                    process_geojson_value(feature, cb);
+                }
+            }
+        }
+        Some("Feature") => {
+            process_geojson_value(&value["geometry"], cb);
+        }
+        Some("GeometryCollection") => {
+            if let Some(geometries) = value["geometries"].as_array() {
+                for geom in geometries {
+                    process_geojson_value(geom, cb);
+                }
+            }
+        }
+        Some(_) => cb(value),
+        None => {}
+    }
+}
+
+fn parse_polygon(geom: &Value) -> Option<Polygon> {
+    if geom["type"] != "Polygon" {
+        return None;
+    }
+    let rings = geom["coordinates"].as_array()?;
+    let mut exterior = Vec::new();
+    let mut interiors = Vec::new();
+
+    for (i, ring) in rings.iter().enumerate() {
+        let coords = ring.as_array()?;
+        let mut points = Vec::with_capacity(coords.len());
+        for coord in coords {
+            let lon = coord[0].as_f64()?;
+            let lat = coord[1].as_f64()?;
+            points.push((lat, lon));
+        }
+        if i == 0 {
+            exterior = points;
+        } else {
+            interiors.push(points);
+        }
+    }
+    Some(Polygon::with_holes(exterior, interiors))
+}
+
+fn parse_multipolygon(geom: &Value) -> Option<Vec<Polygon>> {
+    if geom["type"] != "MultiPolygon" {
+        return None;
+    }
+    let polys = geom["coordinates"].as_array()?;
+    let mut result = Vec::with_capacity(polys.len());
+    for poly_value in polys {
+        // MultiPolygon coordinates are nested one level deeper than Polygon
+        let rings = poly_value.as_array()?;
+        let mut exterior = Vec::new();
+        let mut interiors = Vec::new();
+
+        for (i, ring) in rings.iter().enumerate() {
+            let coords = ring.as_array()?;
+            let mut points = Vec::with_capacity(coords.len());
+            for coord in coords {
+                let lon = coord[0].as_f64()?;
+                let lat = coord[1].as_f64()?;
+                points.push((lat, lon));
+            }
+            if i == 0 {
+                exterior = points;
+            } else {
+                interiors.push(points);
+            }
+        }
+        result.push(Polygon::with_holes(exterior, interiors));
+    }
+    Some(result)
+}
+
+fn parse_linestring(geom: &Value) -> Option<Vec<(f64, f64)>> {
+    if geom["type"] != "LineString" {
+        return None;
+    }
+    let coords = geom["coordinates"].as_array()?;
+    let mut points = Vec::with_capacity(coords.len());
+    for coord in coords {
+        let lon = coord[0].as_f64()?;
+        let lat = coord[1].as_f64()?;
+        points.push((lat, lon));
+    }
+    Some(points)
+}
+
+fn parse_multilinestring(geom: &Value) -> Option<Vec<Vec<(f64, f64)>>> {
+    if geom["type"] != "MultiLineString" {
+        return None;
+    }
+    let lines = geom["coordinates"].as_array()?;
+    let mut result = Vec::with_capacity(lines.len());
+    for line_value in lines {
+        let coords = line_value.as_array()?;
+        let mut points = Vec::with_capacity(coords.len());
+        for coord in coords {
+            let lon = coord[0].as_f64()?;
+            let lat = coord[1].as_f64()?;
+            points.push((lat, lon));
+        }
+        result.push(points);
+    }
+    Some(result)
 }
 
 /// Convert a FlightPlan to a serde_json Value representing a GeoJSON

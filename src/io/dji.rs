@@ -66,6 +66,14 @@ const DEFAULT_AUTO_FLIGHT_SPEED: f64 = 10.0;
 ///
 /// All lines must share the same altitude datum.
 pub fn write_dji_kmz(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
+    let bytes = build_dji_kmz(plan)?;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Serialize `plan` to DJI .kmz archive bytes.
+pub fn build_dji_kmz(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
     validate_datum(plan)?;
 
     let template_xml = build_template_kml(plan)?;
@@ -75,8 +83,8 @@ pub fn write_dji_kmz(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
      * Package the two XML files into a ZIP archive with the .kmz extension.
      * DJI requires the wpmz/ directory prefix inside the archive.
      */
-    let file = std::fs::File::create(path)?;
-    let mut zip = ZipWriter::new(file);
+    let buf = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(buf);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     zip.start_file("wpmz/template.kml", options)
@@ -87,10 +95,11 @@ pub fn write_dji_kmz(path: &Path, plan: &FlightPlan) -> Result<(), IoError> {
         .map_err(|e| IoError::Serialization(format!("ZIP error: {e}")))?;
     zip.write_all(&waylines_xml)?;
 
-    zip.finish()
+    let cursor = zip
+        .finish()
         .map_err(|e| IoError::Serialization(format!("ZIP finish error: {e}")))?;
 
-    Ok(())
+    Ok(cursor.into_inner())
 }
 
 /// Validate that the plan's altitude datum is EGM96 — the only datum DJI accepts.
@@ -316,44 +325,43 @@ fn build_waylines_wpml(plan: &FlightPlan) -> Result<Vec<u8>, IoError> {
         }
 
         /*
-         * Camera trigger action group. Spans all waypoints in this flight
-         * line (index 0 to n-1). Uses reachPoint trigger — the camera fires
-         * once at each waypoint. This matches the photogrammetric waypoint
-         * spacing computed by FlightPlanParams::photo_interval().
+         * Camera trigger action group. Only for survey legs — transit/turn
+         * segments fly without camera activation. Spans all waypoints in
+         * this line (index 0 to n-1).
          */
-        w.write_event(Event::Start(BytesStart::new("wpml:actionGroup")))
-            .map_err(xml_err)?;
-        write_text_element(&mut w, "wpml:actionGroupId", &action_group_id.to_string())?;
-        write_text_element(&mut w, "wpml:actionGroupStartIndex", "0")?;
-        write_text_element(&mut w, "wpml:actionGroupEndIndex", &(n - 1).to_string())?;
-        write_text_element(&mut w, "wpml:actionGroupMode", "sequence")?;
+        if !line.is_transit {
+            w.write_event(Event::Start(BytesStart::new("wpml:actionGroup")))
+                .map_err(xml_err)?;
+            write_text_element(&mut w, "wpml:actionGroupId", &action_group_id.to_string())?;
+            write_text_element(&mut w, "wpml:actionGroupStartIndex", "0")?;
+            write_text_element(&mut w, "wpml:actionGroupEndIndex", &(n - 1).to_string())?;
+            write_text_element(&mut w, "wpml:actionGroupMode", "sequence")?;
 
-        // Trigger condition
-        w.write_event(Event::Start(BytesStart::new("wpml:actionTrigger")))
-            .map_err(xml_err)?;
-        write_text_element(&mut w, "wpml:actionTriggerType", "reachPoint")?;
-        w.write_event(Event::End(BytesEnd::new("wpml:actionTrigger")))
-            .map_err(xml_err)?;
+            w.write_event(Event::Start(BytesStart::new("wpml:actionTrigger")))
+                .map_err(xml_err)?;
+            write_text_element(&mut w, "wpml:actionTriggerType", "reachPoint")?;
+            w.write_event(Event::End(BytesEnd::new("wpml:actionTrigger")))
+                .map_err(xml_err)?;
 
-        // Action: take photo
-        w.write_event(Event::Start(BytesStart::new("wpml:action")))
+            w.write_event(Event::Start(BytesStart::new("wpml:action")))
+                .map_err(xml_err)?;
+            write_text_element(&mut w, "wpml:actionId", "0")?;
+            write_text_element(&mut w, "wpml:actionActuatorFunc", "takePhoto")?;
+            w.write_event(Event::Start(BytesStart::new(
+                "wpml:actionActuatorFuncParam",
+            )))
             .map_err(xml_err)?;
-        write_text_element(&mut w, "wpml:actionId", "0")?;
-        write_text_element(&mut w, "wpml:actionActuatorFunc", "takePhoto")?;
-        w.write_event(Event::Start(BytesStart::new(
-            "wpml:actionActuatorFuncParam",
-        )))
-        .map_err(xml_err)?;
-        write_text_element(&mut w, "wpml:payloadPositionIndex", "0")?;
-        w.write_event(Event::End(BytesEnd::new("wpml:actionActuatorFuncParam")))
-            .map_err(xml_err)?;
-        w.write_event(Event::End(BytesEnd::new("wpml:action")))
-            .map_err(xml_err)?;
+            write_text_element(&mut w, "wpml:payloadPositionIndex", "0")?;
+            w.write_event(Event::End(BytesEnd::new("wpml:actionActuatorFuncParam")))
+                .map_err(xml_err)?;
+            w.write_event(Event::End(BytesEnd::new("wpml:action")))
+                .map_err(xml_err)?;
 
-        w.write_event(Event::End(BytesEnd::new("wpml:actionGroup")))
-            .map_err(xml_err)?;
+            w.write_event(Event::End(BytesEnd::new("wpml:actionGroup")))
+                .map_err(xml_err)?;
 
-        action_group_id += 1;
+            action_group_id += 1;
+        }
 
         w.write_event(Event::End(BytesEnd::new("Folder")))
             .map_err(xml_err)?;

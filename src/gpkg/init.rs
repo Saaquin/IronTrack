@@ -382,6 +382,7 @@ impl GeoPackage {
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 line_index     INTEGER NOT NULL,
                 altitude_datum TEXT    NOT NULL DEFAULT 'EGM2008',
+                completion_pct REAL    NOT NULL DEFAULT 0.0,
                 geom           BLOB    NOT NULL
             );
             "#
@@ -597,6 +598,34 @@ impl GeoPackage {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         Ok(bbox)
+    }
+    /// Update completion percentages for multiple lines in a single transaction.
+    pub fn update_line_statuses(
+        &self,
+        table_name: &str,
+        statuses: &[(usize, f64)],
+    ) -> Result<(), GpkgError> {
+        validate_identifier(table_name)?;
+        self.conn.execute_batch("BEGIN;")?;
+        let result = (|| {
+            let mut stmt = self.conn.prepare(&format!(
+                "UPDATE {table_name} SET completion_pct = ?1 WHERE line_index = ?2"
+            ))?;
+            for (idx, pct) in statuses {
+                stmt.execute(params![pct, *idx as i64])?;
+            }
+            Ok::<(), GpkgError>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 }
 

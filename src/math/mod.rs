@@ -17,4 +17,7 @@
 
 // Mathematical primitives: computational geometry, spatial predicates.
 
+pub mod dubins;
 pub mod geometry;
+pub mod numerics;
+pub mod routing;

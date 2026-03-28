@@ -1,164 +1,50 @@
-# Autopilot Export Implementation Guide
+# Autopilot Export & Trigger System Implementation Guide
 
-**Source docs:** `docs/11_autopilot_formats.md`
-
-## Architecture Overview
-IronTrack generates flight plans as GeoPackage/GeoJSON. To be flyable, those plans
-must be exported to format-specific files that actual autopilots can ingest. Each
-platform has different altitude datum expectations and camera trigger encoding.
+**Source modules:** `src/io/` — `qgc.rs`, `dji.rs`; `src/network/` — `nmea.rs`, `serial_manager.rs`
+**Source docs:** 11, 22, 24, 29, 40, 41, 48, 51
 
 ## Altitude Datum Conversion (Safety-Critical)
-Every export format expects altitudes in a specific datum. The FlightLine's
-`AltitudeDatum` tag and `to_datum()` method handle conversion.
+| Platform | Expected Datum | Conversion |
+|----------|---------------|------------|
+| ArduPilot (frame 3) | MSL | H_egm2008 direct |
+| ArduPilot (frame 11) | AGL over SRTM | scalar offset |
+| DJI WPML (EGM96) | EGM96 orthometric | H_egm96 = H_egm2008 + N_egm2008 - N_egm96 |
+| DJI WPML (WGS84) | WGS84 ellipsoidal | h = H_egm2008 + N_egm2008 |
+| IronTrack Trigger | UTM i32 (×10⁷) | Pre-computed WGS84 Ellipsoidal |
 
-| Platform | Expected Datum | How to convert from EGM2008 |
-|----------|---------------|----------------------------|
-| ArduPilot (frame 3) | MSL relative to home | h_msl = H_egm2008 (direct, close enough) |
-| ArduPilot (frame 11) | AGL over internal SRTM | altitude = desired AGL offset (scalar, not absolute) |
-| DJI WPML (EGM96 mode) | EGM96 orthometric | H_egm96 = H_egm2008 + N_egm2008(lat,lon) - N_egm96(lat,lon) |
-| DJI WPML (WGS84 mode) | WGS84 ellipsoidal | h = H_egm2008 + N_egm2008(lat,lon) |
-| DJI RTK | WGS84 ellipsoidal | h = H_egm2008 + N_egm2008(lat,lon) |
+## Trigger Controller Serial Protocol (v0.8) [Docs 22, 29]
+STM32/RP2040 bare-metal. ESP32 and Raspberry Pi DISQUALIFIED (GPIO jitter).
+Binary frame: magic 0xAA55, MSG_TYPE, PAYLOAD_LEN, PAYLOAD, CRC-32.
+7 message types: UPLOAD_WAYPOINTS, ACK, START_LINE, STOP_LINE, TRIGGER_EVENT, STATUS, ERROR.
+Baud 115200+ (upload), 230400+ (NMEA UART). RTS/CTS MANDATORY. CP2102/FTDI only (CH340 rejected).
+Chunked 512-byte uploads with per-chunk ACK for 15K LiDAR waypoints (120 KB).
 
-**WARNING:** DJI terrain-following compiles static altitudes per-waypoint. The drone
-does NOT dynamically sense terrain — it just follows the pre-baked altitude array.
-IronTrack must pre-compute every waypoint altitude correctly.
+## Sensor Trigger Interfaces [Doc 40]
+- Phase One LEMO: Pin 4 active-low, V_IL<0.8V, V_IH>2.4V, rise/fall <1µs, hold 10-15ms
+- Sony Molex Micro-Fit: Pin 5 TRIGGER active-low, Pin 6 EXPOSURE open-drain (needs pull-up)
+- Hot shoe ISO 518: optocoupler/MOSFET mandatory (legacy thyristor voltage risk)
+- MAVLink MSG 206: acceptable ≤15 m/s UAV speed, rejected for manned 80 m/s
+- DJI PSDK: 460,800 baud, proprietary C-struct on "Command Signaling Channel"
+- USB SDK: ground config only — polling latency unacceptable for mid-flight triggering
 
-## QGroundControl .plan JSON (ArduPilot/PX4)
+## LiDAR Dual-Trigger Architecture [Doc 41]
+LiDAR does NOT need external trigger pulses (continuous emission). "Triggering" = TCP
+start/stop at line boundaries. Cameras need discrete spatial GPIO. For hybrid payloads:
+daemon sends TCP start/stop to LiDAR, trigger controller fires camera GPIO autonomously.
 
-### File Structure
-```json
-{
-  "fileType": "Plan",
-  "version": 1,
-  "groundStation": "IronTrack",
-  "mission": {
-    "cruiseSpeed": 15.0,
-    "firmwareType": 3,
-    "hoverSpeed": 5.0,
-    "vehicleType": 2,
-    "plannedHomePosition": [47.6062, -122.3321, 50.0],
-    "items": []
-  },
-  "geoFence": { "circles": [], "polygons": [], "version": 2 },
-  "rallyPoints": { "points": [], "version": 2 }
-}
-```
+## Event Feedback and PPK [Docs 24, 40]
+Closed-loop (gold standard): camera MEP → GNSS event pin (timestamps actual exposure).
+Open-loop (fallback): trigger controller splits pulse to camera + GNSS simultaneously.
+Phase One MEP: Pin 7, T2 delay 20-30ms. Sony EXPOSURE: Pin 6 open-drain.
+EXIF timestamps DISQUALIFIED (integer-second = 80m ambiguity at fixed-wing speeds).
+PPS-based µs timestamping: PPS latch → MEP delta → absolute UTC.
 
-### Mission Item (SimpleItem)
-```json
-{
-  "autoContinue": true,
-  "command": 16,
-  "doJumpId": 1,
-  "frame": 3,
-  "params": [0, 0, 0, null, 47.6062, -122.3321, 100.0],
-  "type": "SimpleItem"
-}
-```
+## Avionics Hardware Integration [Doc 48]
+Power: synchronous buck from 14V/28V/LiPo bus. TVS SMDJ33A (clamps 53.3V, downstream
+buck must be ≥60V). Critically damped LC filter. Hold-up capacitance for 50ms-1s dropout.
+Grounding: FAA AC 43.13-1B <2.5mΩ, star ground, opto-isolation on GPIO.
+Connectors: MIL-DTL-38999 III (primary), Fischer Core IP68 (external), DB-9 (serial).
 
-Key fields:
-- `command`: MAVLink command ID (16 = NAV_WAYPOINT, 206 = DO_SET_CAM_TRIGG_DIST)
-- `frame`: 3 = GLOBAL_RELATIVE_ALT, 11 = GLOBAL_TERRAIN_ALT_INT
-- `params[4,5]`: latitude, longitude (decimal degrees, NOT scaled integers — QGC handles MAVLink conversion)
-- `params[6]`: altitude in meters (interpretation depends on frame)
-
-### Camera Trigger Encoding
-Insert before first survey waypoint:
-```json
-{ "command": 206, "params": [25.0, 0, 1, 0, 0, 0, 0], "frame": 2, "type": "SimpleItem" }
-```
-- `params[0]` = trigger distance in meters (calculated from photo interval)
-- `params[2]` = 1 to trigger shutter, 0 to stop
-
-Insert after last survey waypoint with `params[0] = 0` to stop triggering.
-
-### Terrain Following
-Set `frame: 11` on all survey waypoints. ArduPilot requires:
-- `TERRAIN_ENABLE = 1`
-- `TERRAIN_FOLLOW = 1`
-- Altitude in params[6] = desired AGL offset (e.g., 100.0 = 100m above terrain)
-- ArduPilot queries its internal SRTM database to compute the absolute MSL target
-
-### MAVLink 2.0 Coordinate Precision
-QGC .plan uses float64 in JSON. Under the hood, MAVLink MISSION_ITEM_INT encodes:
-```
-lat_int = (int32_t)(lat_deg × 1e7)
-lon_int = (int32_t)(lon_deg × 1e7)
-```
-This gives sub-centimeter precision globally. The JSON→MAVLink conversion is handled
-by QGC, not by IronTrack. Just write full f64 precision to the JSON.
-
-## DJI WPML/KMZ
-
-### Package Structure (ZIP archive)
-```
-waypoints_mission.kmz
-└── wpmz/
-    ├── template.kml     # Mission config, survey geometry, global params
-    └── waylines.wpml    # Compiled waypoint array with actions
-```
-
-### template.kml — Mission Config
-```xml
-<wpml:missionConfig>
-  <wpml:flyToWaylineMode>safely</wpml:flyToWaylineMode>
-  <wpml:finishAction>goHome</wpml:finishAction>
-  <wpml:exitOnRCLost>executeLostAction</wpml:exitOnRCLost>
-  <wpml:executeHeightMode>EGM96</wpml:executeHeightMode>
-  <wpml:globalTransitionalSpeed>10.0</wpml:globalTransitionalSpeed>
-  <wpml:takeOffSecurityHeight>30.0</wpml:takeOffSecurityHeight>
-</wpml:missionConfig>
-```
-
-### executeHeightMode values
-- `WGS84` — ellipsoidal height
-- `EGM96` — orthometric height relative to EGM96 geoid
-- `RELATIVE` — AGL relative to takeoff point
-
-For mapping missions, use `EGM96`. Convert from EGM2008 at each waypoint.
-
-### waylines.wpml — Waypoint Array
-Each waypoint in a `<Placemark>` with:
-```xml
-<Point>
-  <coordinates>lon,lat</coordinates>  <!-- NOTE: lon,lat order (KML convention) -->
-</Point>
-<wpml:executeHeight>350.5</wpml:executeHeight>  <!-- EGM96 meters -->
-<wpml:waypointSpeed>12.0</wpml:waypointSpeed>
-```
-
-### Camera Actions (actionGroup)
-```xml
-<wpml:actionGroup>
-  <wpml:actionGroupId>0</wpml:actionGroupId>
-  <wpml:actionGroupStartIndex>0</wpml:actionGroupStartIndex>
-  <wpml:actionGroupEndIndex>47</wpml:actionGroupEndIndex>
-  <wpml:actionGroupMode>sequence</wpml:actionGroupMode>
-  <wpml:actionTrigger>
-    <wpml:actionTriggerType>reachPoint</wpml:actionTriggerType>
-  </wpml:actionTrigger>
-  <wpml:action>
-    <wpml:actionId>0</wpml:actionId>
-    <wpml:actionActuatorFunc>takePhoto</wpml:actionActuatorFunc>
-  </wpml:action>
-</wpml:actionGroup>
-```
-
-For distance-based triggering, use `<wpml:actionTriggerType>betweenAdjacentPoints</wpml:actionTriggerType>`
-with `<wpml:intervalDistance>` set to the photo interval in meters.
-
-### Implementation Notes
-- Use the `zip` crate to create the KMZ archive
-- Use `quick-xml` or manual string building for XML (schema is rigid)
-- KML coordinates are lon,lat (opposite of most Rust geo APIs)
-- DJI payload position: `0` = main gimbal, `1` = right gimbal
-- RTK missions: set `wpml:positioningType` to `RTKBaseStation` or `NetworkRTK`
-
-## Coordinate Order Cheat Sheet
-| Format | Order | Example |
-|--------|-------|---------|
-| QGC .plan JSON params | lat, lon | `[..., 47.6, -122.3, alt]` |
-| GeoJSON | lon, lat | `[-122.3, 47.6]` |
-| KML/WPML coordinates | lon, lat | `-122.3,47.6` |
-| GeoPackage WKB | x(lon), y(lat) | `lon, lat` as f64 |
-| MAVLink MISSION_ITEM_INT | lat×1e7, lon×1e7 | `476062000, -1223321000` |
+## Proprietary SDK Isolation [Doc 51]
+Phase One/DJI SDKs have restrictive EULAs. IPC Bridge Pattern: separate plugin daemon
+links against SDK, communicates with GPLv3 core over TCP/gRPC. No copyleft propagation.

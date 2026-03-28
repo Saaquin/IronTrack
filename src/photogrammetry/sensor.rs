@@ -15,7 +15,68 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::error::PhotogrammetryError;
 use crate::types::SensorParams;
+
+/// Built-in sensor presets.
+pub mod presets {
+    use crate::types::SensorParams;
+
+    /// DJI Phantom 4 Pro / Pro V2.0
+    /// 1-inch CMOS, 20 MP, 8.8 mm lens
+    pub fn phantom4pro() -> SensorParams {
+        SensorParams::new(8.8, 13.2, 8.8, 5472, 3648).unwrap()
+    }
+
+    /// DJI Mavic 3 (Classic / Enterprise)
+    /// 4/3 CMOS, 20 MP, Hasselblad L-Format 24 mm equiv = 12.29 mm actual
+    pub fn mavic3() -> SensorParams {
+        SensorParams::new(12.29, 17.3, 13.0, 5280, 3956).unwrap()
+    }
+
+    /// Phase One iXM-100 with RSM 50mm lens
+    /// 100 MP, 53.4×40 mm back-illuminated CMOS
+    pub fn ixm100() -> SensorParams {
+        SensorParams::new(50.0, 53.4, 40.0, 11664, 8750).unwrap()
+    }
+}
+
+/// Resolve a sensor preset name or custom parameters.
+pub fn resolve_sensor(
+    name: &str,
+    custom_focal_length_mm: Option<f64>,
+    custom_sensor_width_mm: Option<f64>,
+    custom_sensor_height_mm: Option<f64>,
+    custom_image_width_px: Option<u32>,
+    custom_image_height_px: Option<u32>,
+) -> Result<SensorParams, PhotogrammetryError> {
+    if let Some(f) = custom_focal_length_mm {
+        return SensorParams::new(
+            f,
+            custom_sensor_width_mm.ok_or_else(|| {
+                PhotogrammetryError::InvalidSensor("missing sensor_width_mm".into())
+            })?,
+            custom_sensor_height_mm.ok_or_else(|| {
+                PhotogrammetryError::InvalidSensor("missing sensor_height_mm".into())
+            })?,
+            custom_image_width_px.ok_or_else(|| {
+                PhotogrammetryError::InvalidSensor("missing image_width_px".into())
+            })?,
+            custom_image_height_px.ok_or_else(|| {
+                PhotogrammetryError::InvalidSensor("missing image_height_px".into())
+            })?,
+        );
+    }
+
+    match name.to_lowercase().as_str() {
+        "phantom4pro" => Ok(presets::phantom4pro()),
+        "mavic3" => Ok(presets::mavic3()),
+        "ixm100" => Ok(presets::ixm100()),
+        other => Err(PhotogrammetryError::InvalidSensor(format!(
+            "unknown sensor preset: {other}"
+        ))),
+    }
+}
 
 impl SensorParams {
     /// Horizontal field of view in radians.

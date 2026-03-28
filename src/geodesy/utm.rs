@@ -237,6 +237,85 @@ pub fn wgs84_to_utm(coord: GeoCoord) -> Result<UtmCoord, GeodesyError> {
     })
 }
 
+/// Convert WGS84 geodetic coordinates to UTM in a specific zone.
+///
+/// Identical to [`wgs84_to_utm`] except the caller specifies the target zone
+/// instead of deriving it from longitude. This is necessary for corridor
+/// mapping where all centerline vertices must share a single UTM zone even
+/// if the corridor crosses a zone boundary.
+///
+/// # Errors
+/// Returns `GeodesyError::OutOfBounds` if latitude exceeds +/-84 degrees.
+/// Returns `GeodesyError::ProjectionFailure` if zone is outside 1..=60.
+pub fn wgs84_to_utm_in_zone(
+    coord: GeoCoord,
+    zone: u8,
+    hemisphere: Hemisphere,
+) -> Result<UtmCoord, GeodesyError> {
+    let lat_deg = coord.lat_deg();
+    let lon_deg = coord.lon_deg();
+
+    if !(1..=60).contains(&zone) {
+        return Err(GeodesyError::ProjectionFailure(format!(
+            "UTM zone must be 1..=60, got {zone}"
+        )));
+    }
+
+    if !(-84.0..=84.0).contains(&lat_deg) {
+        return Err(GeodesyError::OutOfBounds {
+            lat: lat_deg,
+            lon: lon_deg,
+        });
+    }
+
+    let lambda0 = central_meridian(zone).to_radians();
+    let phi = coord.lat_rad();
+    let lambda = coord.lon_rad();
+
+    let a0 = rectifying_radius();
+    let alpha = alpha_coefficients();
+
+    let e = crate::types::WGS84_E2.sqrt();
+    let e_sin_phi = e * phi.sin();
+    let chi = 2.0
+        * ((std::f64::consts::FRAC_PI_4 + phi / 2.0).tan()
+            * ((1.0 - e_sin_phi) / (1.0 + e_sin_phi)).powf(e / 2.0))
+        .atan()
+        - std::f64::consts::FRAC_PI_2;
+
+    let delta_lambda = lambda - lambda0;
+    let cos_chi = chi.cos();
+    let sin_chi = chi.sin();
+    let cos_dlam = delta_lambda.cos();
+    let sin_dlam = delta_lambda.sin();
+
+    let xi_prime = sin_chi.atan2(cos_chi * cos_dlam);
+    let eta_prime = (cos_chi * sin_dlam).atanh();
+
+    let mut xi = xi_prime;
+    let mut eta = eta_prime;
+    for (j, &a_j) in alpha.iter().enumerate() {
+        let jj = 2.0 * (j as f64 + 1.0);
+        xi += a_j * (jj * xi_prime).sin() * (jj * eta_prime).cosh();
+        eta += a_j * (jj * xi_prime).cos() * (jj * eta_prime).sinh();
+    }
+
+    let easting = FALSE_EASTING + K0 * a0 * eta;
+    let false_northing = if hemisphere == Hemisphere::South {
+        FALSE_NORTHING_SOUTH
+    } else {
+        0.0
+    };
+    let northing = false_northing + K0 * a0 * xi;
+
+    Ok(UtmCoord {
+        easting,
+        northing,
+        zone,
+        hemisphere,
+    })
+}
+
 /// Convert a UTM coordinate back to WGS84 geodetic (decimal degrees).
 ///
 /// Returns `(lat_deg, lon_deg)`.

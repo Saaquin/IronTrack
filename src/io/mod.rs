@@ -23,7 +23,7 @@ pub mod geojson;
 pub mod kml;
 pub mod qgc;
 
-pub use dji::write_dji_kmz;
-pub use geojson::write_geojson;
-pub use kml::parse_boundary;
+pub use dji::{build_dji_kmz, write_dji_kmz};
+pub use geojson::{geojson_to_linestrings, geojson_to_polygons, write_geojson};
+pub use kml::{parse_boundary, parse_centerline};
 pub use qgc::write_qgc_plan;

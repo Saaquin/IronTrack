@@ -24,7 +24,7 @@ pub mod utm;
 
 pub use geoid::Egm2008Model;
 pub use karney::{geodesic_direct, geodesic_inverse, GeodesicDirect, GeodesicInverse};
-pub use utm::{central_meridian, utm_to_wgs84, utm_zone, wgs84_to_utm};
+pub use utm::{central_meridian, utm_to_wgs84, utm_zone, wgs84_to_utm, wgs84_to_utm_in_zone};
 
 #[cfg(test)]
 mod tests {

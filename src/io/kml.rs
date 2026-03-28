@@ -206,6 +206,91 @@ fn parse_coordinate_text(text: &str, ring: &mut Vec<(f64, f64)>) -> Result<(), I
     Ok(())
 }
 
+/// Parse a KML or KMZ file and return all `<LineString>` elements as
+/// `Vec<(f64, f64)>` vertex lists (lat, lon in decimal degrees).
+///
+/// This is the corridor equivalent of [`parse_boundary`]: it extracts
+/// polyline centerlines rather than polygon boundaries.
+pub fn parse_centerline(path: &Path) -> Result<Vec<Vec<(f64, f64)>>, IoError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let xml_bytes = match ext.as_str() {
+        "kmz" => read_kml_from_kmz(path)?,
+        _ => std::fs::read(path)?,
+    };
+
+    parse_kml_linestrings(&xml_bytes)
+}
+
+/// Parse KML XML bytes and extract all `<LineString>` elements.
+fn parse_kml_linestrings(xml: &[u8]) -> Result<Vec<Vec<(f64, f64)>>, IoError> {
+    let mut reader = Reader::from_reader(Cursor::new(xml));
+    reader.config_mut().trim_text(true);
+
+    let mut linestrings: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut buf = Vec::new();
+
+    let mut in_linestring = false;
+    let mut in_coordinates = false;
+    let mut current_coords: Vec<(f64, f64)> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let name_bytes = e.name().as_ref().to_vec();
+                let local = local_name(&name_bytes);
+                match local {
+                    "LineString" => {
+                        in_linestring = true;
+                        current_coords.clear();
+                    }
+                    "coordinates" if in_linestring => {
+                        in_coordinates = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let name_bytes = e.name().as_ref().to_vec();
+                let local = local_name(&name_bytes);
+                match local {
+                    "LineString" => {
+                        if current_coords.len() >= 2 {
+                            linestrings.push(std::mem::take(&mut current_coords));
+                        }
+                        in_linestring = false;
+                    }
+                    "coordinates" if in_coordinates => {
+                        in_coordinates = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(ref e)) if in_coordinates => {
+                let text = e
+                    .unescape()
+                    .map_err(|err| IoError::Serialization(format!("KML text error: {err}")))?;
+                parse_coordinate_text(&text, &mut current_coords)?;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(IoError::Serialization(format!(
+                    "KML parse error at position {}: {e}",
+                    reader.buffer_position()
+                )));
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(linestrings)
+}
+
 /// Extract the local name from a potentially namespace-prefixed tag.
 /// e.g. "kml:Polygon" → "Polygon", "coordinates" → "coordinates".
 fn local_name(name: &[u8]) -> &str {
@@ -361,5 +446,40 @@ mod tests {
         assert!(min_lon > -1.0 && min_lon < 1.0, "lon in expected range");
         assert!(max_lat > min_lat);
         assert!(max_lon > min_lon);
+    }
+
+    #[test]
+    fn parse_linestring() {
+        let kml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark>
+    <LineString>
+      <coordinates>-0.1,51.5 0.0,51.6 0.1,51.7</coordinates>
+    </LineString>
+  </Placemark>
+</kml>"#;
+        let lines = parse_kml_linestrings(kml.as_bytes()).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 3);
+        // Verify lat/lon order (KML is lon,lat; we store as (lat, lon)).
+        assert!((lines[0][0].0 - 51.5).abs() < 1e-9, "first lat");
+        assert!((lines[0][0].1 - (-0.1)).abs() < 1e-9, "first lon");
+    }
+
+    #[test]
+    fn parse_linestring_too_short_is_excluded() {
+        let kml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Placemark>
+    <LineString>
+      <coordinates>-0.1,51.5</coordinates>
+    </LineString>
+  </Placemark>
+</kml>"#;
+        let lines = parse_kml_linestrings(kml.as_bytes()).unwrap();
+        assert!(
+            lines.is_empty(),
+            "single-vertex linestring should be excluded"
+        );
     }
 }

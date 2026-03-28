@@ -195,6 +195,14 @@ impl GeoidModel {
 /// terrain-following AGL math is most sensitive. IronTrack uses this model when
 /// processing Copernicus tiles to ensure datum consistency.
 ///
+/// ## Tide system alignment
+///
+/// Both Copernicus DEM GLO-30 and EGM2008 use the **Tide-Free** system.
+/// No tide system correction is needed when applying EGM2008 undulations
+/// to Copernicus elevations. If a future DEM source uses the Mean-Tide or
+/// Zero-Tide convention, a correction of up to ~0.1 m would be required.
+/// See `docs/12_egm2008_grid_analysis.md` §Tide System for details.
+///
 /// ## Precision
 ///
 /// Delegates to the `egm2008` crate (FlightAware, BSD-3-Clause, pure Rust).

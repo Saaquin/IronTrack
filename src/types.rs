@@ -249,6 +249,10 @@ pub struct FlightLine {
     /// Vertical datum that the values in `elevations` are referenced to.
     /// Always set this when constructing a `FlightLine` from a DEM pass.
     pub altitude_datum: AltitudeDatum,
+    /// Transit/ferry segment — not a survey leg. Autopilot exporters
+    /// suppress camera triggering for transit lines (procedure turns,
+    /// repositioning legs). Default: false (survey leg).
+    pub is_transit: bool,
 }
 
 impl FlightLine {
@@ -451,6 +455,257 @@ pub struct MissionParams {
     ///
     /// Set to 0.0 to disable the check (simulation / unit-test contexts only).
     pub min_clearance_m: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Kinematic limits
+// ---------------------------------------------------------------------------
+
+/// Aerodynamic and kinematic constraints for the flight platform.
+///
+/// These limits are enforced by the elastic band solver (Phase 5A) and the
+/// dynamic look-ahead pursuit controller (Phase 5C) to ensure physically
+/// realisable flight paths. All values must be positive and finite.
+///
+/// The derived methods translate pilot-facing limits (pitch degrees, g-load)
+/// into the geometric quantities (slope, curvature, look-ahead distance) that
+/// the trajectory algorithms actually constrain.
+///
+/// Reference: `docs/34_terrain_following_planning.md` Table 1 —
+/// Aerodynamic Constraint Translation to Geometric Bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct KinematicLimits {
+    /// Survey ground speed (m/s). Drives curvature and look-ahead calculations.
+    pub survey_speed_mps: f64,
+    /// Maximum pitch angle (degrees). Translates to max terrain slope via tan.
+    /// Typical values: 10–15 deg for fixed-wing, 20–30 deg for multirotor.
+    pub max_pitch_deg: f64,
+    /// Maximum vertical acceleration (multiples of g). Translates to max path
+    /// curvature via kappa_max = (a_max_g * 9.81) / V^2.
+    /// Typical values: 0.5–1.0 g.
+    pub max_vert_accel_g: f64,
+    /// Maximum pitch rate (degrees/second). Bounds the rate of slope change
+    /// along the path. Typical values: 3–5 deg/s.
+    pub max_pitch_rate_dps: f64,
+    /// Maximum sustained climb rate (m/s). Used in look-ahead distance
+    /// calculation. Typical values: 3–5 m/s (fixed-wing), 5–8 m/s (multirotor).
+    pub max_climb_mps: f64,
+    /// Maximum sustained descent rate (m/s). Positive value = descending.
+    /// Typical values: 2–4 m/s (fixed-wing), 3–6 m/s (multirotor).
+    pub max_descent_mps: f64,
+}
+
+impl KinematicLimits {
+    /// Validated constructor. All fields must be positive and finite.
+    pub fn new(
+        survey_speed_mps: f64,
+        max_pitch_deg: f64,
+        max_vert_accel_g: f64,
+        max_pitch_rate_dps: f64,
+        max_climb_mps: f64,
+        max_descent_mps: f64,
+    ) -> Result<Self, PhotogrammetryError> {
+        let fields = [
+            ("survey_speed_mps", survey_speed_mps),
+            ("max_pitch_deg", max_pitch_deg),
+            ("max_vert_accel_g", max_vert_accel_g),
+            ("max_pitch_rate_dps", max_pitch_rate_dps),
+            ("max_climb_mps", max_climb_mps),
+            ("max_descent_mps", max_descent_mps),
+        ];
+        for (name, val) in &fields {
+            if !val.is_finite() || *val <= 0.0 {
+                return Err(PhotogrammetryError::InvalidInput(format!(
+                    "KinematicLimits: {name} must be positive and finite, got {val}"
+                )));
+            }
+        }
+        Ok(Self {
+            survey_speed_mps,
+            max_pitch_deg,
+            max_vert_accel_g,
+            max_pitch_rate_dps,
+            max_climb_mps,
+            max_descent_mps,
+        })
+    }
+
+    /// Conservative defaults for a small multirotor (DJI Phantom-class).
+    ///
+    /// - Speed: 8 m/s (~29 km/h)
+    /// - Max pitch: 25 deg (multirotors can pitch aggressively)
+    /// - Max vertical accel: 0.8 g
+    /// - Max pitch rate: 5 deg/s
+    /// - Climb: 5 m/s, Descent: 3 m/s
+    pub fn multirotor_default() -> Self {
+        Self {
+            survey_speed_mps: 8.0,
+            max_pitch_deg: 25.0,
+            max_vert_accel_g: 0.8,
+            max_pitch_rate_dps: 5.0,
+            max_climb_mps: 5.0,
+            max_descent_mps: 3.0,
+        }
+    }
+
+    /// Conservative defaults for a fixed-wing sUAS.
+    ///
+    /// - Speed: 30 m/s (~108 km/h)
+    /// - Max pitch: 12 deg (structural and comfort limit)
+    /// - Max vertical accel: 0.5 g
+    /// - Max pitch rate: 3 deg/s
+    /// - Climb: 3 m/s, Descent: 2 m/s
+    pub fn fixed_wing_default() -> Self {
+        Self {
+            survey_speed_mps: 30.0,
+            max_pitch_deg: 12.0,
+            max_vert_accel_g: 0.5,
+            max_pitch_rate_dps: 3.0,
+            max_climb_mps: 3.0,
+            max_descent_mps: 2.0,
+        }
+    }
+
+    /// Maximum terrain-following slope the platform can sustain.
+    ///
+    /// `max_slope = tan(max_pitch_deg * PI / 180)`
+    ///
+    /// This is the geometric constraint on the first derivative of the
+    /// flight path (dy/dx in the vertical plane).
+    pub fn max_slope(&self) -> f64 {
+        (self.max_pitch_deg * std::f64::consts::PI / 180.0).tan()
+    }
+
+    /// Maximum path curvature (1/m) at survey speed.
+    ///
+    /// `kappa_max = (max_vert_accel_g * 9.81) / survey_speed_mps^2`
+    ///
+    /// This is the geometric constraint on the second derivative of the
+    /// flight path. Exceeding kappa_max means exceeding the vertical
+    /// acceleration limit of the airframe.
+    pub fn max_curvature(&self) -> f64 {
+        (self.max_vert_accel_g * 9.81) / (self.survey_speed_mps * self.survey_speed_mps)
+    }
+
+    /// Minimum dynamic look-ahead distance (m) for a given height change.
+    ///
+    /// `L_a_min = (delta_h * V) / V_z_max`
+    ///
+    /// where V_z_max is the max climb rate (positive delta_h) or max descent
+    /// rate (negative delta_h). This is the shortest distance the aircraft
+    /// needs to begin reacting to an upcoming terrain change.
+    pub fn min_lookahead(&self, delta_h: f64) -> f64 {
+        let v_z_max = if delta_h >= 0.0 {
+            self.max_climb_mps
+        } else {
+            self.max_descent_mps
+        };
+        (delta_h.abs() * self.survey_speed_mps) / v_z_max
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Airspace advisory types
+// ---------------------------------------------------------------------------
+
+/// ICAO/FAA airspace classification.
+///
+/// IronTrack is advisory-only: the PIC retains ultimate authority. The system
+/// never enforces geofences by refusing to generate waypoints or deleting
+/// planned lines. Legitimate survey operations fly inside Class B/C/D under
+/// pre-arranged ATC clearances.
+///
+/// Reference: `docs/35_airspace_obstacle_data.md`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AirspaceClass {
+    A,
+    B,
+    C,
+    D,
+    E,
+    G,
+}
+
+/// Advisory alert level per AC 25-11B.
+///
+/// Ordering: Advisory < Caution < Warning. Red and amber are NEVER used
+/// for non-alerting UI elements to preserve attention-getting characteristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AlertLevel {
+    /// Green/cyan/white — informational, optional low-intrusion audio.
+    /// Upcoming line start, approaching uncontrolled Class G, etc.
+    Advisory,
+    /// Amber — single/repeating chime.
+    /// 3-min approach to TFR/controlled airspace without clearance;
+    /// RTK degradation; approaching unverified obstacle buffer.
+    Caution,
+    /// Red flashing — continuous loud tone.
+    /// Imminent collision with verified obstacle, prohibited area/TFR
+    /// penetration, severe terrain conflict.
+    Warning,
+}
+
+/// Proximity advisory for an airspace boundary.
+///
+/// Generated when the planned or actual flight path approaches or
+/// penetrates controlled airspace. Advisory only — the pilot acknowledges
+/// and the plan continues.
+#[derive(Debug, Clone)]
+pub struct AirspaceAdvisory {
+    /// Airspace classification.
+    pub class: AirspaceClass,
+    /// Human-readable name (e.g., "SEA Class B").
+    pub name: String,
+    /// Floor altitude in metres MSL (converted from FAA FL/AGL/MSL).
+    pub floor_m_msl: f64,
+    /// Ceiling altitude in metres MSL.
+    pub ceiling_m_msl: f64,
+    /// Horizontal distance to the nearest boundary segment (metres).
+    pub lateral_distance_m: f64,
+    /// Current alert level based on time-to-CPA (not static distance).
+    pub alert_level: AlertLevel,
+}
+
+/// Proximity advisory for a charted obstacle (from FAA Digital Obstacle File).
+///
+/// Both verified ("O"/"V") and unverified ("U") obstacles are ingested.
+/// Both types pose equal physical hazard.
+///
+/// Buffer radius = 10x the obstacle's AGL height, accounting for guy-wires,
+/// structure width, and coordinate uncertainty.
+///
+/// Reference: `docs/35_airspace_obstacle_data.md`
+#[derive(Debug, Clone)]
+pub struct ObstacleAdvisory {
+    /// Human-readable description (e.g., "TOWER", "BLDG", "STACK").
+    pub description: String,
+    /// Obstacle position — latitude (decimal degrees).
+    pub lat_deg: f64,
+    /// Obstacle position — longitude (decimal degrees).
+    pub lon_deg: f64,
+    /// Height above ground level (metres).
+    pub height_agl_m: f64,
+    /// Height above mean sea level (metres).
+    pub height_msl_m: f64,
+    /// Horizontal distance from flight path to obstacle (metres).
+    pub lateral_distance_m: f64,
+    /// True if the obstacle has been surveyed/verified ("O" or "V" in DOF).
+    /// False if unverified ("U") — reported but not confirmed.
+    pub verified: bool,
+    /// Current alert level.
+    pub alert_level: AlertLevel,
+    /// Buffer radius = 10 x height_agl_m (metres).
+    pub buffer_radius_m: f64,
+}
+
+impl ObstacleAdvisory {
+    /// Compute the standard buffer radius for an obstacle.
+    ///
+    /// Per doc 35: buffer = 10x the obstacle's AGL height. This accounts
+    /// for guy-wires, structure width, and coordinate uncertainty.
+    pub fn standard_buffer_radius(height_agl_m: f64) -> f64 {
+        10.0 * height_agl_m
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,5 +969,114 @@ mod tests {
     fn flightline_default_datum_is_egm2008() {
         let fl = FlightLine::default();
         assert_eq!(fl.altitude_datum, AltitudeDatum::Egm2008);
+    }
+
+    // --- KinematicLimits ----------------------------------------------------
+
+    #[test]
+    fn kinematic_limits_valid_construction() {
+        let limits = KinematicLimits::new(30.0, 12.0, 0.5, 3.0, 3.0, 2.0);
+        assert!(limits.is_ok());
+    }
+
+    #[test]
+    fn kinematic_limits_rejects_zero_speed() {
+        assert!(KinematicLimits::new(0.0, 12.0, 0.5, 3.0, 3.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn kinematic_limits_rejects_negative_accel() {
+        assert!(KinematicLimits::new(30.0, 12.0, -0.5, 3.0, 3.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn kinematic_limits_rejects_nan() {
+        assert!(KinematicLimits::new(f64::NAN, 12.0, 0.5, 3.0, 3.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn kinematic_limits_rejects_infinity() {
+        assert!(KinematicLimits::new(30.0, f64::INFINITY, 0.5, 3.0, 3.0, 2.0).is_err());
+    }
+
+    #[test]
+    fn multirotor_default_values_sensible() {
+        let m = KinematicLimits::multirotor_default();
+        assert!(m.survey_speed_mps > 0.0 && m.survey_speed_mps < 30.0);
+        assert!(m.max_pitch_deg > 10.0 && m.max_pitch_deg < 45.0);
+        assert!(m.max_vert_accel_g > 0.0 && m.max_vert_accel_g <= 2.0);
+        assert!(m.max_climb_mps > 0.0);
+        assert!(m.max_descent_mps > 0.0);
+    }
+
+    #[test]
+    fn fixed_wing_default_values_sensible() {
+        let fw = KinematicLimits::fixed_wing_default();
+        assert!(fw.survey_speed_mps > 20.0);
+        assert!(fw.max_pitch_deg > 5.0 && fw.max_pitch_deg < 20.0);
+        assert!(fw.max_vert_accel_g > 0.0 && fw.max_vert_accel_g <= 1.0);
+        assert!(fw.max_climb_mps > 0.0);
+        assert!(fw.max_descent_mps > 0.0);
+    }
+
+    #[test]
+    fn max_slope_at_15_deg() {
+        let limits = KinematicLimits::new(30.0, 15.0, 0.5, 3.0, 3.0, 2.0).unwrap();
+        // tan(15 deg) = 0.26795...
+        assert_abs_diff_eq!(
+            limits.max_slope(),
+            15.0_f64.to_radians().tan(),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn max_curvature_at_30mps_half_g() {
+        let limits = KinematicLimits::new(30.0, 12.0, 0.5, 3.0, 3.0, 2.0).unwrap();
+        // kappa_max = (0.5 * 9.81) / (30^2) = 4.905 / 900 = 0.00545
+        let expected = (0.5 * 9.81) / (30.0 * 30.0);
+        assert_abs_diff_eq!(limits.max_curvature(), expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn min_lookahead_climb() {
+        let limits = KinematicLimits::new(30.0, 12.0, 0.5, 3.0, 3.0, 2.0).unwrap();
+        // L_a_min = (50m * 30m/s) / 3m/s = 500m
+        assert_abs_diff_eq!(limits.min_lookahead(50.0), 500.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn min_lookahead_descent_uses_descent_rate() {
+        let limits = KinematicLimits::new(30.0, 12.0, 0.5, 3.0, 3.0, 2.0).unwrap();
+        // L_a_min = (50m * 30m/s) / 2m/s = 750m (descent rate is lower)
+        assert_abs_diff_eq!(limits.min_lookahead(-50.0), 750.0, epsilon = 1e-12);
+    }
+
+    // --- Airspace advisory types -----------------------------------------------
+
+    #[test]
+    fn alert_level_ordering() {
+        assert!(AlertLevel::Advisory < AlertLevel::Caution);
+        assert!(AlertLevel::Caution < AlertLevel::Warning);
+        assert!(AlertLevel::Advisory < AlertLevel::Warning);
+    }
+
+    #[test]
+    fn obstacle_buffer_radius_formula() {
+        // 150m AGL antenna -> 1500m buffer radius
+        assert_abs_diff_eq!(
+            ObstacleAdvisory::standard_buffer_radius(150.0),
+            1500.0,
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn obstacle_buffer_radius_zero_height() {
+        assert_abs_diff_eq!(
+            ObstacleAdvisory::standard_buffer_radius(0.0),
+            0.0,
+            epsilon = 1e-10
+        );
     }
 }

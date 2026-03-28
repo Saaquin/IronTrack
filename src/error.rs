@@ -115,6 +115,32 @@ pub enum IoError {
 }
 
 // ---------------------------------------------------------------------------
+// AI errors
+// ---------------------------------------------------------------------------
+
+/// Errors from the Claude API integration (natural language queries and
+/// flight plan parameter extraction).
+#[derive(Debug, Error)]
+pub enum AiError {
+    /// The ANTHROPIC_API_KEY environment variable is missing or empty.
+    #[error("ANTHROPIC_API_KEY environment variable not set")]
+    MissingApiKey,
+    /// An HTTP-level failure occurred when calling the Claude API.
+    #[error("Claude API HTTP error: {0}")]
+    Http(String),
+    /// The Claude API returned a non-2xx status with an error body.
+    #[error("Claude API error (HTTP {status}): {message}")]
+    Api { status: u16, message: String },
+    /// Failed to deserialize the Claude API JSON response.
+    #[error("Claude API response parse error: {0}")]
+    ResponseParse(String),
+    /// The model response did not contain the expected structured JSON
+    /// for NlPlan extraction (e.g. no JSON block found, schema mismatch).
+    #[error("could not extract flight plan parameters from AI response: {0}")]
+    ExtractionFailed(String),
+}
+
+// ---------------------------------------------------------------------------
 // Photogrammetry errors
 // ---------------------------------------------------------------------------
 
@@ -145,6 +171,50 @@ pub enum PhotogrammetryError {
     /// (e.g., degenerate bounding box, non-finite azimuth). Carries a
     /// human-readable description of the violated constraint.
     #[error("invalid input: {0}")]
+    InvalidInput(String),
+}
+
+// ---------------------------------------------------------------------------
+// Trajectory errors
+// ---------------------------------------------------------------------------
+
+/// Errors from the terrain-following trajectory pipeline (elastic band,
+/// B-spline smoothing, pursuit controller).
+#[derive(Debug, Error)]
+pub enum TrajectoryError {
+    /// The elastic band solver did not converge within the iteration limit.
+    #[error(
+        "elastic band failed to converge after {iterations} iterations \
+         (max displacement {max_disp_m:.4} m)"
+    )]
+    ConvergenceFailure { iterations: usize, max_disp_m: f64 },
+
+    /// Path curvature exceeds the platform's vertical acceleration limit.
+    #[error("curvature {kappa:.6} 1/m exceeds limit {kappa_max:.6} 1/m at node {node_index}")]
+    CurvatureViolation {
+        node_index: usize,
+        kappa: f64,
+        kappa_max: f64,
+    },
+
+    /// Flight path altitude drops below minimum AGL clearance.
+    #[error(
+        "altitude {alt_m:.1} m is {deficit_m:.1} m below min AGL {min_agl_m:.1} m \
+         at node {node_index}"
+    )]
+    ClearanceViolation {
+        node_index: usize,
+        alt_m: f64,
+        min_agl_m: f64,
+        deficit_m: f64,
+    },
+
+    /// Terrain query failed during trajectory generation.
+    #[error("terrain query failed: {0}")]
+    Terrain(#[from] DemError),
+
+    /// Invalid input to the trajectory pipeline.
+    #[error("invalid trajectory input: {0}")]
     InvalidInput(String),
 }
 
@@ -227,5 +297,21 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("8.5"), "expected computed AGL in: {msg}");
         assert!(msg.contains("30"), "expected min safe AGL in: {msg}");
+    }
+
+    #[test]
+    fn ai_error_missing_key_display() {
+        let e = AiError::MissingApiKey;
+        assert!(e.to_string().contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn ai_error_api_display() {
+        let e = AiError::Api {
+            status: 429,
+            message: "rate limited".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("429") && msg.contains("rate limited"));
     }
 }
