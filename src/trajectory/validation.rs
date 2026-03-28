@@ -213,13 +213,13 @@ pub fn validate_profile(
 
     // Stage 3: Pursuit controller
     let controller = PursuitController::new(*limits);
-    let waypoints =
-        match controller.generate_waypoints(&spline, waypoint_interval, terrain_lookup) {
-            Ok(wps) => wps,
-            Err(e) => {
-                return fail_result(profile_type, format!("Pursuit failed: {e}"));
-            }
-        };
+    let waypoints = match controller.generate_waypoints(&spline, waypoint_interval, terrain_lookup)
+    {
+        Ok(wps) => wps,
+        Err(e) => {
+            return fail_result(profile_type, format!("Pursuit failed: {e}"));
+        }
+    };
 
     // Assertions
     let max_slope_limit = limits.max_slope();
