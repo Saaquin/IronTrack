@@ -150,27 +150,28 @@ fn identity_transform_egm2008_returns_unchanged() {
     let (_dir, engine) = empty_engine();
     let points = [(39.7, -104.9, 1500.0), (47.5, -121.5, 800.0)];
     let line = flight_line_from_degrees(AltitudeDatum::Egm2008, &points);
+    let original = line.clone();
 
     let result = line
         .to_datum(AltitudeDatum::Egm2008, &engine)
         .expect("identity transform");
 
     assert_eq!(result.altitude_datum, AltitudeDatum::Egm2008);
-    assert_eq!(result.len(), line.len());
-    for i in 0..line.len() {
+    assert_eq!(result.len(), original.len());
+    for i in 0..original.len() {
         assert_eq!(
             result.lats()[i],
-            line.lats()[i],
+            original.lats()[i],
             "lat mismatch at index {i}"
         );
         assert_eq!(
             result.lons()[i],
-            line.lons()[i],
+            original.lons()[i],
             "lon mismatch at index {i}"
         );
         assert_eq!(
             result.elevations()[i],
-            line.elevations()[i],
+            original.elevations()[i],
             "elevation mismatch at index {i}"
         );
     }
@@ -506,6 +507,7 @@ fn multipoint_determinism() {
 
     // Run the same transform twice.
     let result_a = line
+        .clone()
         .to_datum(AltitudeDatum::Egm2008, &engine)
         .expect("first transform");
     let result_b = line
@@ -533,6 +535,7 @@ fn multipoint_roundtrip_all_recover() {
         (35.7, 139.7, 40.0), // Tokyo
     ];
     let line = flight_line_from_degrees(AltitudeDatum::Wgs84Ellipsoidal, &points);
+    let original_elevations: Vec<f64> = line.elevations().to_vec();
 
     // WGS84 → EGM2008 → WGS84
     let converted = line
@@ -545,7 +548,7 @@ fn multipoint_roundtrip_all_recover() {
     for i in 0..points.len() {
         assert_abs_diff_eq!(
             recovered.elevations()[i],
-            line.elevations()[i],
+            original_elevations[i],
             epsilon = 1e-6
         );
     }

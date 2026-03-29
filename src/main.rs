@@ -869,11 +869,12 @@ fn run_plan(args: PlanArgs) -> Result<()> {
                 .context("cannot initialise terrain engine for datum conversion")?,
         };
 
-        let mut converted_lines = Vec::with_capacity(plan.lines.len());
-        for line in &plan.lines {
-            converted_lines.push(line.to_datum(target_datum, &engine)?);
+        let lines = std::mem::take(&mut plan.lines);
+        let mut converted = Vec::with_capacity(lines.len());
+        for line in lines {
+            converted.push(line.to_datum(target_datum, &engine)?);
         }
-        plan.lines = converted_lines;
+        plan.lines = converted;
         println!("Altitude datum conversion: applied (target: {target_datum}).");
     }
 
@@ -961,7 +962,8 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             let mut converted = Vec::with_capacity(plan.lines.len());
             for line in &plan.lines {
                 converted.push(
-                    line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+                    line.clone()
+                        .to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
                         .context("QGC datum conversion to WGS84 ellipsoidal failed")?,
                 );
             }
@@ -1019,7 +1021,8 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             let mut converted = Vec::with_capacity(plan.lines.len());
             for line in &plan.lines {
                 converted.push(
-                    line.to_datum(AltitudeDatum::Egm96, &engine)
+                    line.clone()
+                        .to_datum(AltitudeDatum::Egm96, &engine)
                         .context("DJI datum conversion to EGM96 failed")?,
                 );
             }
@@ -1345,11 +1348,12 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
             None => TerrainEngine::new()
                 .context("cannot initialise terrain engine for datum conversion")?,
         };
-        let mut converted_lines = Vec::with_capacity(plan.lines.len());
-        for line in &plan.lines {
-            converted_lines.push(line.to_datum(target_datum, &engine)?);
+        let lines = std::mem::take(&mut plan.lines);
+        let mut converted = Vec::with_capacity(lines.len());
+        for line in lines {
+            converted.push(line.to_datum(target_datum, &engine)?);
         }
-        plan.lines = converted_lines;
+        plan.lines = converted;
         println!("Altitude datum conversion: applied (target: {target_datum}).");
     }
 
@@ -1414,7 +1418,8 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
             let mut converted = Vec::with_capacity(plan.lines.len());
             for line in &plan.lines {
                 converted.push(
-                    line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
+                    line.clone()
+                        .to_datum(AltitudeDatum::Wgs84Ellipsoidal, &engine)
                         .context("QGC datum conversion to WGS84 ellipsoidal failed")?,
                 );
             }
@@ -1449,7 +1454,8 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
             let mut converted = Vec::with_capacity(plan.lines.len());
             for line in &plan.lines {
                 converted.push(
-                    line.to_datum(AltitudeDatum::Egm96, &engine)
+                    line.clone()
+                        .to_datum(AltitudeDatum::Egm96, &engine)
                         .context("DJI datum conversion to EGM96 failed")?,
                 );
             }

@@ -283,6 +283,37 @@ impl FlightLine {
         self.lats.is_empty()
     }
 
+    /// Construct a FlightLine directly from pre-built SoA vectors.
+    /// All three vectors must have equal length.
+    pub(crate) fn from_parts(
+        lats: Vec<f64>,
+        lons: Vec<f64>,
+        elevations: Vec<f64>,
+        datum: AltitudeDatum,
+        is_transit: bool,
+    ) -> Self {
+        debug_assert_eq!(lats.len(), lons.len());
+        debug_assert_eq!(lats.len(), elevations.len());
+        Self {
+            lats,
+            lons,
+            elevations,
+            altitude_datum: datum,
+            is_transit,
+        }
+    }
+
+    /// Decompose into owned SoA vectors. Inverse of `from_parts`.
+    pub(crate) fn into_parts(self) -> (Vec<f64>, Vec<f64>, Vec<f64>, AltitudeDatum, bool) {
+        (
+            self.lats,
+            self.lons,
+            self.elevations,
+            self.altitude_datum,
+            self.is_transit,
+        )
+    }
+
     pub fn lats(&self) -> &[f64] {
         &self.lats
     }

@@ -166,6 +166,8 @@ pub async fn run_server(
         run_persistence_task(state_clone).await;
     });
 
+    let shutdown_state = state.clone();
+
     let app = Router::new()
         .route("/api/v1/mission/load", post(load_mission))
         .route("/api/v1/mission/plan", get(get_plan))
@@ -173,13 +175,45 @@ pub async fn run_server(
         .route("/api/v1/mission/export/qgc", get(export_qgc))
         .route("/api/v1/mission/export/dji", get(export_dji))
         .route("/ws", get(ws_handler))
+        // TODO: restrict CORS origin before any network-exposed deployment.
+        // CorsLayer::permissive() is acceptable for local dev only.
         .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("IronTrack FMS daemon listening on {}", addr);
-    axum::serve(listener, app).await?;
+    let shutdown = async {
+        tokio::signal::ctrl_c().await.ok();
+        log::info!("shutdown signal received, cleaning up…");
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+
+    // Run PRAGMA optimize + WAL checkpoint before closing the database.
+    // Architecture rule: VACUUM is prohibited; PRAGMA optimize is the
+    // required shutdown-time maintenance action.
+    //
+    // Note: the background persistence task may still hold an open connection.
+    // In WAL mode concurrent readers are safe, but wal_checkpoint(TRUNCATE)
+    // requires exclusive access. If SQLITE_BUSY occurs, the database remains
+    // consistent — only the WAL file isn't truncated. This is best-effort.
+    let state_guard = shutdown_state.read().await;
+    if let Some(ref path) = state_guard.persistence_path {
+        match GeoPackage::open(path) {
+            Ok(gpkg) => {
+                if let Err(e) = gpkg
+                    .conn
+                    .execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")
+                {
+                    log::error!("shutdown PRAGMA failed: {e}");
+                }
+            }
+            Err(e) => log::error!("could not open GeoPackage for shutdown cleanup: {e}"),
+        }
+    }
 
     Ok(())
 }
@@ -454,7 +488,10 @@ fn generate_plan_internal(
             .lidar_fov
             .ok_or_else(|| anyhow::anyhow!("missing lidar_fov"))?;
         let sensor = LidarSensorParams::new(prr, scan_rate, fov, 0.0)?;
-        let agl = req.altitude_msl.unwrap_or(100.0);
+        let agl = req.altitude_msl.unwrap_or_else(|| {
+            log::warn!("altitude_msl not provided, defaulting to 100.0 m");
+            100.0
+        });
         let ground_speed = if let Some(density) = req.target_density {
             crate::photogrammetry::lidar::required_speed_for_density(&sensor, agl, density)?
         } else {
@@ -498,8 +535,20 @@ fn generate_plan_internal(
     }
 
     if req.optimize_route && plan.lines.len() >= 2 {
-        let launch_lat = req.launch_lat.unwrap_or(bbox.min_lat);
-        let launch_lon = req.launch_lon.unwrap_or(bbox.min_lon);
+        let launch_lat = req.launch_lat.unwrap_or_else(|| {
+            log::warn!(
+                "launch_lat not provided, defaulting to bbox min_lat ({:.6})",
+                bbox.min_lat
+            );
+            bbox.min_lat
+        });
+        let launch_lon = req.launch_lon.unwrap_or_else(|| {
+            log::warn!(
+                "launch_lon not provided, defaulting to bbox min_lon ({:.6})",
+                bbox.min_lon
+            );
+            bbox.min_lon
+        });
         let result = optimize_route(&plan.lines, launch_lat, launch_lon);
         let mut reordered = Vec::with_capacity(plan.lines.len());
         for (idx, &line_idx) in result.order.iter().enumerate() {
@@ -527,11 +576,12 @@ fn generate_plan_internal(
     }
 
     if plan.lines.iter().any(|l| l.altitude_datum != target_datum) {
-        let mut converted_lines = Vec::with_capacity(plan.lines.len());
-        for line in &plan.lines {
-            converted_lines.push(line.to_datum(target_datum, terrain_engine)?);
+        let lines = std::mem::take(&mut plan.lines);
+        let mut converted = Vec::with_capacity(lines.len());
+        for line in lines {
+            converted.push(line.to_datum(target_datum, terrain_engine)?);
         }
-        plan.lines = converted_lines;
+        plan.lines = converted;
     }
 
     Ok(plan)
@@ -554,7 +604,10 @@ fn generate_corridor_plan_internal(
     let corridor_width = req
         .corridor_width
         .ok_or_else(|| anyhow::anyhow!("missing corridor_width"))?;
-    let corridor_passes = req.corridor_passes.unwrap_or(3);
+    let corridor_passes = req.corridor_passes.unwrap_or_else(|| {
+        log::warn!("corridor_passes not provided, defaulting to 3");
+        3
+    });
 
     let sensor_params = resolve_sensor(
         &req.sensor,
@@ -595,8 +648,20 @@ fn generate_corridor_plan_internal(
     };
 
     if req.optimize_route && plan.lines.len() >= 2 {
-        let launch_lat = req.launch_lat.unwrap_or(centerline[0].0);
-        let launch_lon = req.launch_lon.unwrap_or(centerline[0].1);
+        let launch_lat = req.launch_lat.unwrap_or_else(|| {
+            log::warn!(
+                "launch_lat not provided, defaulting to centerline start ({:.6})",
+                centerline[0].0
+            );
+            centerline[0].0
+        });
+        let launch_lon = req.launch_lon.unwrap_or_else(|| {
+            log::warn!(
+                "launch_lon not provided, defaulting to centerline start ({:.6})",
+                centerline[0].1
+            );
+            centerline[0].1
+        });
         let result = optimize_route(&plan.lines, launch_lat, launch_lon);
         let mut reordered = Vec::with_capacity(plan.lines.len());
         for (idx, &line_idx) in result.order.iter().enumerate() {
@@ -624,11 +689,12 @@ fn generate_corridor_plan_internal(
     }
 
     if plan.lines.iter().any(|l| l.altitude_datum != target_datum) {
-        let mut converted_lines = Vec::with_capacity(plan.lines.len());
-        for line in &plan.lines {
-            converted_lines.push(line.to_datum(target_datum, terrain_engine)?);
+        let lines = std::mem::take(&mut plan.lines);
+        let mut converted = Vec::with_capacity(lines.len());
+        for line in lines {
+            converted.push(line.to_datum(target_datum, terrain_engine)?);
         }
-        plan.lines = converted_lines;
+        plan.lines = converted;
     }
 
     Ok(plan)
