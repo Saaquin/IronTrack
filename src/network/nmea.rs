@@ -84,12 +84,12 @@ fn parse_gga(fields: &[&str], state: &mut CurrentState) -> bool {
     }
 
     // Latitude: Field 2 (ddmm.mmmm), Field 3 (N/S)
-    if let Some(lat) = parse_lat_lon(fields[2], fields[3]) {
+    if let Some(lat) = parse_nmea_coordinate(fields[2], fields[3], 2) {
         state.lat = lat;
     }
 
     // Longitude: Field 4 (dddmm.mmmm), Field 5 (E/W)
-    if let Some(lon) = parse_lat_lon(fields[4], fields[5]) {
+    if let Some(lon) = parse_nmea_coordinate(fields[4], fields[5], 3) {
         state.lon = lon;
     }
 
@@ -137,13 +137,13 @@ fn parse_ggk(fields: &[&str], state: &mut CurrentState) -> bool {
         return false;
     }
 
-    // Latitude: Field 4
-    if let Some(lat) = parse_lat_lon(fields[4], fields[5]) {
+    // Latitude: Field 4 (ddmm.mmmm)
+    if let Some(lat) = parse_nmea_coordinate(fields[4], fields[5], 2) {
         state.lat = lat;
     }
 
-    // Longitude: Field 6
-    if let Some(lon) = parse_lat_lon(fields[6], fields[7]) {
+    // Longitude: Field 6 (dddmm.mmmm)
+    if let Some(lon) = parse_nmea_coordinate(fields[6], fields[7], 3) {
         state.lon = lon;
     }
 
@@ -166,20 +166,35 @@ fn parse_ggk(fields: &[&str], state: &mut CurrentState) -> bool {
     true
 }
 
-fn parse_lat_lon(val: &str, dir: &str) -> Option<f64> {
+/// Parse an NMEA coordinate field into decimal degrees.
+///
+/// `deg_len` is the fixed number of degree digits in the NMEA format:
+/// - 2 for latitude  (ddmm.mmmm)
+/// - 3 for longitude (dddmm.mmmm)
+///
+/// Returns `None` on any parse failure — never defaults to 0.0.
+fn parse_nmea_coordinate(val: &str, dir: &str, deg_len: usize) -> Option<f64> {
     if val.is_empty() || dir.is_empty() {
         return None;
     }
 
-    // Split degrees and minutes
-    // Latitude: ddmm.mmmm -> 2 digits for degrees
-    // Longitude: dddmm.mmmm -> 3 digits for degrees
-    let dot_pos = val.find('.')?;
-    let deg_len = dot_pos.saturating_sub(2);
+    // Reject invalid hemisphere markers
+    if !matches!(dir, "N" | "S" | "E" | "W") {
+        return None;
+    }
+
+    // Reject inputs too short to contain degrees + at least "mm" for minutes
+    if val.len() < deg_len + 2 {
+        return None;
+    }
 
     let (deg_part, min_part) = val.split_at(deg_len);
-    let deg = deg_part.parse::<f64>().unwrap_or(0.0);
+    let deg = deg_part.parse::<f64>().ok()?;
     let min = min_part.parse::<f64>().ok()?;
+
+    if !(0.0..60.0).contains(&min) {
+        return None;
+    }
 
     let mut result = deg + (min / 60.0);
     if dir == "S" || dir == "W" {
@@ -192,20 +207,116 @@ fn parse_lat_lon(val: &str, dir: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    // ------------------------------------------------------------------
+    // Checksum validation
+    // ------------------------------------------------------------------
+
     #[test]
-    fn test_checksum() {
-        // Checksum is XOR of all bytes between '$' and '*' (exclusive).
-        // Computed: 0x53 for this GGA sentence.
+    fn checksum_valid() {
         assert!(validate_checksum(
             "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53"
         ));
+    }
+
+    #[test]
+    fn checksum_invalid_rejects_corrupted() {
         assert!(!validate_checksum(
             "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*48"
         ));
     }
 
     #[test]
-    fn test_parse_gga() {
+    fn checksum_missing_dollar_sign() {
+        assert!(!validate_checksum("GNGGA,123519.00*53"));
+    }
+
+    #[test]
+    fn checksum_missing_asterisk() {
+        assert!(!validate_checksum("$GNGGA,123519.00"));
+    }
+
+    // ------------------------------------------------------------------
+    // parse_nmea_coordinate — unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn coord_standard_latitude() {
+        // "4807.038" with deg_len=2 → degrees=48, minutes=07.038 → 48 + 7.038/60
+        let result = parse_nmea_coordinate("4807.038", "N", 2).unwrap();
+        assert!((result - 48.1173).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coord_standard_longitude() {
+        // "01131.000" with deg_len=3 → degrees=011, minutes=31.000 → 11.51667
+        let result = parse_nmea_coordinate("01131.000", "E", 3).unwrap();
+        assert!((result - 11.51667).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coord_low_degree_longitude() {
+        // "00530.000" → degrees=005, minutes=30.000 → 5.5
+        let result = parse_nmea_coordinate("00530.000", "E", 3).unwrap();
+        assert!((result - 5.5).abs() < 1e-7);
+    }
+
+    #[test]
+    fn coord_180_longitude() {
+        // "18000.000" → degrees=180, minutes=00.000 → 180.0
+        let result = parse_nmea_coordinate("18000.000", "E", 3).unwrap();
+        assert!((result - 180.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn coord_south_negates() {
+        let result = parse_nmea_coordinate("3330.000", "S", 2).unwrap();
+        assert!((result - -33.5).abs() < 1e-7);
+    }
+
+    #[test]
+    fn coord_west_negates() {
+        let result = parse_nmea_coordinate("09446.0071", "W", 3).unwrap();
+        assert!(result < 0.0);
+    }
+
+    #[test]
+    fn coord_malformed_too_short_returns_none() {
+        // "1.5" is too short for deg_len=2 (needs at least 2+2=4 chars)
+        assert!(parse_nmea_coordinate("1.5", "N", 2).is_none());
+    }
+
+    #[test]
+    fn coord_malformed_minutes_ge_60_returns_none() {
+        // "4860.000" → degrees=48, minutes=60.000 — invalid
+        assert!(parse_nmea_coordinate("4860.000", "N", 2).is_none());
+    }
+
+    #[test]
+    fn coord_empty_value_returns_none() {
+        assert!(parse_nmea_coordinate("", "N", 2).is_none());
+    }
+
+    #[test]
+    fn coord_empty_direction_returns_none() {
+        assert!(parse_nmea_coordinate("4807.038", "", 2).is_none());
+    }
+
+    #[test]
+    fn coord_non_numeric_returns_none() {
+        assert!(parse_nmea_coordinate("ABCD.EFG", "N", 2).is_none());
+    }
+
+    #[test]
+    fn coord_invalid_hemisphere_returns_none() {
+        assert!(parse_nmea_coordinate("4807.038", "X", 2).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Full GGA sentence parsing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_gga_standard() {
         let mut state = CurrentState::default();
         let sentence =
             "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
@@ -217,10 +328,13 @@ mod tests {
         assert_eq!(state.alt_datum, AltitudeDatum::Egm96);
     }
 
+    // ------------------------------------------------------------------
+    // Full RMC sentence parsing
+    // ------------------------------------------------------------------
+
     #[test]
-    fn test_parse_rmc() {
+    fn parse_rmc_standard() {
         let mut state = CurrentState::default();
-        // Checksum 0x37 computed for this RMC sentence.
         let sentence =
             "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
         assert!(NmeaParser::parse(sentence, &mut state));
