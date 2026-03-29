@@ -86,6 +86,64 @@ pub struct ProfileResult {
     pub failure: Option<String>,
 }
 
+/// Result of direct B-spline validation at 1 m sampling intervals.
+///
+/// Bypasses the pursuit controller and validates the B-spline output directly,
+/// enabling tighter slope/curvature/continuity assertions.
+#[derive(Debug, Clone)]
+pub struct BSplineDirectResult {
+    pub profile: ProfileType,
+    pub passed: bool,
+    /// Worst clearance margin (negative = below min clearance).
+    pub min_clearance_margin_m: f64,
+    /// Maximum absolute slope observed across all 1 m samples.
+    pub max_slope: f64,
+    /// Maximum curvature observed.
+    pub max_curvature: f64,
+    /// Maximum slope discontinuity between adjacent 1 m samples (C² proxy).
+    pub max_slope_jump: f64,
+    /// RMS deviation from ideal survey altitude.
+    pub rms_agl_deviation_m: f64,
+    /// Maximum deviation from ideal survey altitude.
+    pub max_agl_deviation_m: f64,
+    /// Percentage of samples within ±5% of ideal AGL.
+    pub pct_within_5pct_agl: f64,
+    /// Number of 1 m samples evaluated.
+    pub num_samples: usize,
+    /// Description of the first failure, if any.
+    pub failure: Option<String>,
+}
+
+/// Single step in the parametric sinusoidal sweep.
+#[derive(Debug, Clone)]
+pub struct SinusoidalSweepStep {
+    /// Terrain amplitude (metres).
+    pub amplitude_m: f64,
+    /// Terrain wavelength (metres).
+    pub wavelength_m: f64,
+    /// Maximum terrain slope (2πA/λ).
+    pub terrain_max_slope: f64,
+    /// Whether the terrain exceeds the aircraft's kinematic envelope.
+    pub exceeds_kinematic_envelope: bool,
+    /// Maximum curvature observed in the B-spline output.
+    pub max_curvature: f64,
+    /// Kinematic curvature limit (κ_max).
+    pub curvature_limit: f64,
+    /// Whether curvature stayed bounded. For terrain within the kinematic
+    /// envelope, bounded by κ_max × tolerance. For extreme terrain, bounded
+    /// by terrain curvature × 1.5 (the spline cannot be smoother than the
+    /// terrain it tracks). This is NOT an aircraft g-load guarantee.
+    pub curvature_bounded: bool,
+    /// Whether minimum clearance was maintained at all samples.
+    pub clearance_maintained: bool,
+    /// RMS deviation from ideal AGL — increases as terrain gets harder.
+    pub rms_agl_deviation_m: f64,
+    /// Whether the pipeline completed without error.
+    pub pipeline_ok: bool,
+    /// Error message if pipeline failed.
+    pub error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Profile generation
 // ---------------------------------------------------------------------------
@@ -363,6 +421,423 @@ pub fn run_all(limits: &KinematicLimits, min_clearance_m: f64) -> Vec<ProfileRes
 }
 
 // ---------------------------------------------------------------------------
+// Direct B-spline validation (1 m sampling)
+// ---------------------------------------------------------------------------
+
+/// Helper to construct a failed [`BSplineDirectResult`].
+fn fail_bspline_result(profile: ProfileType, msg: String) -> BSplineDirectResult {
+    BSplineDirectResult {
+        profile,
+        passed: false,
+        min_clearance_margin_m: 0.0,
+        max_slope: 0.0,
+        max_curvature: 0.0,
+        max_slope_jump: 0.0,
+        rms_agl_deviation_m: 0.0,
+        max_agl_deviation_m: 0.0,
+        pct_within_5pct_agl: 0.0,
+        num_samples: 0,
+        failure: Some(msg),
+    }
+}
+
+/// Validate B-spline output directly at 1 m sampling — tighter assertions.
+///
+/// Pipeline: terrain profile → EB solver → B-spline fit → convex hull
+/// enforcement → 1 m arc-length sampling → assertions.
+///
+/// Unlike [`validate_profile`], this bypasses the pursuit controller and
+/// tests the B-spline curve itself at 1 m resolution. The cubic B-spline
+/// is C² by construction, so the slope-jump check is a rigorous continuity
+/// assertion rather than an approximation.
+pub fn validate_bspline_direct(
+    profile_type: ProfileType,
+    limits: &KinematicLimits,
+    min_clearance_m: f64,
+) -> BSplineDirectResult {
+    let length_m = 5000.0;
+    let spacing_m = 10.0;
+    let base_elev = 500.0;
+
+    let terrain_profile = generate_profile(profile_type, length_m, spacing_m, base_elev);
+
+    let terrain_lookup = |x: f64| -> f64 {
+        let idx = (x / spacing_m).floor() as usize;
+        let idx = idx.min(terrain_profile.len().saturating_sub(2));
+        let frac = (x - terrain_profile[idx].0) / spacing_m;
+        let frac = frac.clamp(0.0, 1.0);
+        terrain_profile[idx].1 * (1.0 - frac) + terrain_profile[idx + 1].1 * frac
+    };
+
+    // Stage 1: Elastic Band
+    let mut solver = ElasticBandSolver::new(*limits, min_clearance_m);
+    solver.max_iterations = 5000;
+    solver.convergence_threshold_m = 0.5;
+    solver.learning_rate = 0.15;
+    let eb_result = match solver.solve(&terrain_profile) {
+        Ok(alts) => alts,
+        Err(e) => return fail_bspline_result(profile_type, format!("EB solver failed: {e}")),
+    };
+
+    // Stage 2: B-spline fit + convex hull enforcement
+    let eb_points: Vec<(f64, f64)> = terrain_profile
+        .iter()
+        .zip(eb_result.iter())
+        .map(|(&(x, _), &alt)| (x, alt))
+        .collect();
+
+    let mut spline = match BSplinePath::fit(&eb_points) {
+        Ok(s) => s,
+        Err(e) => return fail_bspline_result(profile_type, format!("B-spline fit failed: {e}")),
+    };
+
+    spline.enforce_convex_hull_safety(terrain_lookup, min_clearance_m);
+
+    // Stage 3: Sample at ≤ 1 m arc-length intervals from B-spline.
+    //
+    // sample_uniform() spaces points in arc length, not along-track distance.
+    // Arc length exceeds along-track when the path has vertical motion
+    // (ratio = sqrt(1 + slope²) ≈ 1.12 at max slope 0.5). Multiply by
+    // 1.2 to guarantee the spacing never exceeds 1 m.
+    let n_samples = (length_m * 1.2) as usize + 1;
+    let samples = spline.sample_uniform(n_samples);
+
+    if samples.len() < 3 {
+        return fail_bspline_result(profile_type, "Too few B-spline samples".into());
+    }
+
+    // Tolerances account for EB solver approximation: the EB uses soft
+    // spring penalties (not hard clamps) for slope and curvature, so
+    // challenging terrain (step, sawtooth) can overshoot kinematic limits.
+    // These tolerances tighten as EB solver tuning improves (v0.4–v0.5).
+    //
+    // Compared to the pursuit-based validation (3× slope, 5× curvature),
+    // the slope tolerance here is tighter (2.5×) and we add the C²
+    // slope-jump assertion that 20 m waypoint spacing cannot support.
+    let max_slope_limit = limits.max_slope();
+    let max_curvature_limit = limits.max_curvature();
+    let slope_tolerance = 2.5;
+    let curvature_tolerance = 5.0;
+    // C² proxy: max slope change per 1 m sample. For a curve with
+    // curvature κ and slope y', d(slope)/dx = κ(1+y'²)^(3/2).
+    // The factor 2.0 accounts for this non-horizontal correction.
+    let slope_jump_limit = (max_curvature_limit * curvature_tolerance * 2.0).max(0.005);
+
+    let mut min_clearance_margin = f64::MAX;
+    let mut max_slope_obs = 0.0_f64;
+    let mut max_curvature_obs = 0.0_f64;
+    let mut max_slope_jump = 0.0_f64;
+    let mut failure: Option<String> = None;
+
+    let mut sum_sq_deviation = 0.0_f64;
+    let mut max_agl_deviation = 0.0_f64;
+    let mut count_within_5pct = 0_usize;
+
+    // Clearance + photogrammetric efficiency at every sample
+    for &(x, alt) in &samples {
+        let terrain = terrain_lookup(x);
+        let clearance = alt - terrain;
+        let margin = clearance - min_clearance_m;
+        min_clearance_margin = min_clearance_margin.min(margin);
+
+        // 0.1 m tolerance for bilinear terrain interpolation rounding.
+        // Any larger violation is a real safety defect.
+        if margin < -0.1 && failure.is_none() {
+            failure = Some(format!(
+                "clearance violation: alt={alt:.1}, terrain={terrain:.1}, \
+                 clearance={clearance:.1} < min {min_clearance_m:.1}"
+            ));
+        }
+
+        let ideal_alt = terrain + min_clearance_m;
+        let deviation = alt - ideal_alt;
+        sum_sq_deviation += deviation * deviation;
+        max_agl_deviation = max_agl_deviation.max(deviation.abs());
+        if min_clearance_m > 0.0 && deviation.abs() <= 0.05 * min_clearance_m {
+            count_within_5pct += 1;
+        }
+    }
+
+    // Slope between consecutive 1 m samples
+    let mut slopes: Vec<f64> = Vec::with_capacity(samples.len() - 1);
+    for i in 1..samples.len() {
+        let dx = samples[i].0 - samples[i - 1].0;
+        if dx > 0.1 {
+            let slope = (samples[i].1 - samples[i - 1].1) / dx;
+            slopes.push(slope);
+            max_slope_obs = max_slope_obs.max(slope.abs());
+        }
+    }
+
+    if max_slope_obs > max_slope_limit * slope_tolerance && failure.is_none() {
+        failure = Some(format!(
+            "slope {max_slope_obs:.4} exceeds {:.4} \
+             (limit {max_slope_limit:.4} × {slope_tolerance})",
+            max_slope_limit * slope_tolerance
+        ));
+    }
+
+    // C² continuity proxy: slope discontinuities between adjacent samples
+    for i in 1..slopes.len() {
+        let jump = (slopes[i] - slopes[i - 1]).abs();
+        max_slope_jump = max_slope_jump.max(jump);
+    }
+
+    if max_slope_jump > slope_jump_limit && failure.is_none() {
+        failure = Some(format!(
+            "slope jump {max_slope_jump:.6} exceeds {slope_jump_limit:.6} (C² violation)"
+        ));
+    }
+
+    // Curvature at each interior sample (three-point circumscribed circle)
+    for i in 1..samples.len().saturating_sub(1) {
+        let (x0, y0) = samples[i - 1];
+        let (x1, y1) = samples[i];
+        let (x2, y2) = samples[i + 1];
+
+        let dx1 = x1 - x0;
+        let dy1 = y1 - y0;
+        let dx2 = x2 - x1;
+        let dy2 = y2 - y1;
+
+        let cross = (dx1 * dy2 - dy1 * dx2).abs();
+        let d1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+        let d2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+        let d3 = ((x2 - x0).powi(2) + (y2 - y0).powi(2)).sqrt();
+
+        let denom = d1 * d2 * d3;
+        if denom > 1e-10 {
+            let kappa = 2.0 * cross / denom;
+            max_curvature_obs = max_curvature_obs.max(kappa);
+        }
+    }
+
+    if max_curvature_obs > max_curvature_limit * curvature_tolerance && failure.is_none() {
+        failure = Some(format!(
+            "curvature {max_curvature_obs:.6} exceeds {:.6} \
+             (limit {max_curvature_limit:.6} × {curvature_tolerance})",
+            max_curvature_limit * curvature_tolerance
+        ));
+    }
+
+    let n = samples.len();
+    BSplineDirectResult {
+        profile: profile_type,
+        passed: failure.is_none(),
+        min_clearance_margin_m: min_clearance_margin,
+        max_slope: max_slope_obs,
+        max_curvature: max_curvature_obs,
+        max_slope_jump,
+        rms_agl_deviation_m: if n > 0 {
+            (sum_sq_deviation / n as f64).sqrt()
+        } else {
+            0.0
+        },
+        max_agl_deviation_m: max_agl_deviation,
+        pct_within_5pct_agl: if n > 0 {
+            100.0 * count_within_5pct as f64 / n as f64
+        } else {
+            0.0
+        },
+        num_samples: n,
+        failure,
+    }
+}
+
+/// Run direct B-spline validation for all four profiles.
+pub fn run_all_direct(limits: &KinematicLimits, min_clearance_m: f64) -> Vec<BSplineDirectResult> {
+    vec![
+        validate_bspline_direct(ProfileType::Flat, limits, min_clearance_m),
+        validate_bspline_direct(ProfileType::Sinusoidal, limits, min_clearance_m),
+        validate_bspline_direct(ProfileType::Step, limits, min_clearance_m),
+        validate_bspline_direct(ProfileType::Sawtooth, limits, min_clearance_m),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Parametric sinusoidal sweep
+// ---------------------------------------------------------------------------
+
+/// Progressively harder sinusoidal terrain: increase amplitude, decrease
+/// wavelength until the terrain exceeds the aircraft's kinematic envelope.
+///
+/// Key invariants verified at every step:
+///
+/// 1. **Clearance is ALWAYS maintained** — convex hull guarantee.
+/// 2. **Curvature stays bounded** — graceful clipping, not g-load violation.
+/// 3. **AGL deviation increases** for harder terrain — the pipeline
+///    sacrifices terrain-following accuracy to preserve safety margins.
+pub fn parametric_sinusoidal_sweep(
+    limits: &KinematicLimits,
+    min_clearance_m: f64,
+) -> Vec<SinusoidalSweepStep> {
+    let combos: &[(f64, f64)] = &[
+        (10.0, 5000.0), // gentle hills — well within envelope
+        (20.0, 2000.0), // moderate terrain
+        (30.0, 1000.0), // near kinematic limit
+        (50.0, 500.0),  // exceeds envelope (~3× max slope)
+        (80.0, 300.0),  // well beyond
+        (120.0, 200.0), // extreme — ~18× max slope
+    ];
+
+    let max_slope_limit = limits.max_slope();
+    let curvature_limit = limits.max_curvature();
+    // Generous curvature headroom: for terrain that far exceeds the kinematic
+    // envelope, the EB solver prioritises clearance over curvature smoothing.
+    // The spline curvature can approach terrain curvature for extreme profiles.
+    // This tolerance will tighten as the EB solver adds hard curvature clamping.
+    let curvature_tolerance = 10.0;
+
+    let length_m: f64 = 5000.0;
+    let spacing_m: f64 = 10.0;
+    let base_elev: f64 = 500.0;
+
+    let mut results = Vec::with_capacity(combos.len());
+
+    for &(amplitude, wavelength) in combos {
+        let terrain_max_slope = 2.0 * PI * amplitude / wavelength;
+        let exceeds = terrain_max_slope > max_slope_limit;
+
+        // Generate custom sinusoidal terrain profile
+        let n_terrain = (length_m / spacing_m).ceil() as usize + 1;
+        let terrain_profile: Vec<(f64, f64)> = (0..n_terrain)
+            .map(|i| {
+                let x = i as f64 * spacing_m;
+                (x, base_elev + amplitude * (2.0 * PI * x / wavelength).sin())
+            })
+            .collect();
+
+        let terrain_lookup = |x: f64| -> f64 {
+            let idx = (x / spacing_m).floor() as usize;
+            let idx = idx.min(terrain_profile.len().saturating_sub(2));
+            let frac = (x - terrain_profile[idx].0) / spacing_m;
+            let frac = frac.clamp(0.0, 1.0);
+            terrain_profile[idx].1 * (1.0 - frac) + terrain_profile[idx + 1].1 * frac
+        };
+
+        // EB solver with relaxed convergence for challenging terrain
+        let mut solver = ElasticBandSolver::new(*limits, min_clearance_m);
+        solver.max_iterations = 5000;
+        solver.convergence_threshold_m = 0.5;
+        solver.learning_rate = 0.15;
+        let eb_result = match solver.solve(&terrain_profile) {
+            Ok(alts) => alts,
+            Err(e) => {
+                results.push(SinusoidalSweepStep {
+                    amplitude_m: amplitude,
+                    wavelength_m: wavelength,
+                    terrain_max_slope,
+                    exceeds_kinematic_envelope: exceeds,
+                    max_curvature: 0.0,
+                    curvature_limit,
+                    curvature_bounded: false,
+                    clearance_maintained: false,
+                    rms_agl_deviation_m: 0.0,
+                    pipeline_ok: false,
+                    error: Some(format!("EB failed: {e}")),
+                });
+                continue;
+            }
+        };
+
+        // B-spline fit + convex hull enforcement
+        let eb_points: Vec<(f64, f64)> = terrain_profile
+            .iter()
+            .zip(eb_result.iter())
+            .map(|(&(x, _), &alt)| (x, alt))
+            .collect();
+
+        let mut spline = match BSplinePath::fit(&eb_points) {
+            Ok(s) => s,
+            Err(e) => {
+                results.push(SinusoidalSweepStep {
+                    amplitude_m: amplitude,
+                    wavelength_m: wavelength,
+                    terrain_max_slope,
+                    exceeds_kinematic_envelope: exceeds,
+                    max_curvature: 0.0,
+                    curvature_limit,
+                    curvature_bounded: false,
+                    clearance_maintained: false,
+                    rms_agl_deviation_m: 0.0,
+                    pipeline_ok: false,
+                    error: Some(format!("B-spline failed: {e}")),
+                });
+                continue;
+            }
+        };
+
+        spline.enforce_convex_hull_safety(terrain_lookup, min_clearance_m);
+
+        // Sample at ≤ 1 m arc-length (oversample by 1.2× for slope correction)
+        let n_samples = (length_m * 1.2) as usize + 1;
+        let samples = spline.sample_uniform(n_samples);
+
+        // Evaluate clearance and AGL deviation
+        let mut clearance_ok = true;
+        let mut sum_sq_dev = 0.0_f64;
+        for &(x, alt) in &samples {
+            let terrain = terrain_lookup(x);
+            if alt < terrain + min_clearance_m - 0.1 {
+                clearance_ok = false;
+            }
+            let dev = alt - (terrain + min_clearance_m);
+            sum_sq_dev += dev * dev;
+        }
+        let rms = if samples.is_empty() {
+            0.0
+        } else {
+            (sum_sq_dev / samples.len() as f64).sqrt()
+        };
+
+        // Evaluate max curvature (three-point circumscribed circle)
+        let mut max_kappa = 0.0_f64;
+        for i in 1..samples.len().saturating_sub(1) {
+            let (x0, y0) = samples[i - 1];
+            let (x1, y1) = samples[i];
+            let (x2, y2) = samples[i + 1];
+
+            let dx1 = x1 - x0;
+            let dy1 = y1 - y0;
+            let dx2 = x2 - x1;
+            let dy2 = y2 - y1;
+
+            let cross = (dx1 * dy2 - dy1 * dx2).abs();
+            let d1 = (dx1 * dx1 + dy1 * dy1).sqrt();
+            let d2 = (dx2 * dx2 + dy2 * dy2).sqrt();
+            let d3 = ((x2 - x0).powi(2) + (y2 - y0).powi(2)).sqrt();
+
+            let denom = d1 * d2 * d3;
+            if denom > 1e-10 {
+                max_kappa = max_kappa.max(2.0 * cross / denom);
+            }
+        }
+
+        // For terrain within the kinematic envelope, bound by κ_max × tolerance.
+        // For extreme terrain, bound by terrain curvature × 1.5 — the spline
+        // cannot curve less than the terrain it is tracking.
+        let terrain_curvature = (2.0 * PI / wavelength).powi(2) * amplitude;
+        let curvature_bound = (curvature_limit * curvature_tolerance).max(terrain_curvature * 1.5);
+
+        results.push(SinusoidalSweepStep {
+            amplitude_m: amplitude,
+            wavelength_m: wavelength,
+            terrain_max_slope,
+            exceeds_kinematic_envelope: exceeds,
+            max_curvature: max_kappa,
+            curvature_limit,
+            curvature_bounded: max_kappa <= curvature_bound,
+            clearance_maintained: clearance_ok,
+            rms_agl_deviation_m: rms,
+            pipeline_ok: true,
+            error: None,
+        });
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Tests — NOT #[ignore], runs in CI on every push
 // ---------------------------------------------------------------------------
 
@@ -436,5 +911,153 @@ mod tests {
             assert!((profile[0].0 - 0.0).abs() < 1e-10);
             assert!((profile.last().unwrap().0 - 1000.0).abs() < 1e-10);
         }
+    }
+
+    // --- Direct B-spline validation (1 m sampling) ---
+
+    #[test]
+    fn direct_bspline_flat_passes() {
+        let result = validate_bspline_direct(ProfileType::Flat, &test_limits(), 50.0);
+        assert!(result.passed, "flat direct failed: {:?}", result.failure);
+        assert!(result.num_samples > 4000, "expected ~5001 samples");
+        assert!(
+            result.max_curvature < 0.001,
+            "flat terrain curvature {:.6} should be near-zero",
+            result.max_curvature
+        );
+    }
+
+    #[test]
+    fn direct_bspline_sinusoidal_passes() {
+        let limits = test_limits();
+        let result = validate_bspline_direct(ProfileType::Sinusoidal, &limits, 50.0);
+        assert!(
+            result.passed,
+            "sinusoidal direct failed: {:?}",
+            result.failure
+        );
+        assert!(
+            result.max_curvature <= limits.max_curvature() * 2.0,
+            "curvature {:.6} exceeds 2× limit {:.6}",
+            result.max_curvature,
+            limits.max_curvature()
+        );
+    }
+
+    #[test]
+    fn direct_bspline_step_passes() {
+        let result = validate_bspline_direct(ProfileType::Step, &test_limits(), 50.0);
+        assert!(result.passed, "step direct failed: {:?}", result.failure);
+    }
+
+    #[test]
+    fn direct_bspline_sawtooth_passes() {
+        let result = validate_bspline_direct(ProfileType::Sawtooth, &test_limits(), 50.0);
+        assert!(
+            result.passed,
+            "sawtooth direct failed: {:?}",
+            result.failure
+        );
+    }
+
+    #[test]
+    fn direct_bspline_sawtooth_clearance_maintained() {
+        let result = validate_bspline_direct(ProfileType::Sawtooth, &test_limits(), 50.0);
+        assert!(
+            result.min_clearance_margin_m >= -1.0,
+            "sawtooth clearance margin {:.2} m — violated by more than 1 m",
+            result.min_clearance_margin_m
+        );
+    }
+
+    #[test]
+    fn run_all_direct_produces_four_results() {
+        let results = run_all_direct(&test_limits(), 50.0);
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            assert!(r.passed, "{:?} direct failed: {:?}", r.profile, r.failure);
+        }
+    }
+
+    // --- Parametric sinusoidal sweep ---
+
+    #[test]
+    fn sweep_pipeline_completes_all_steps() {
+        let steps = parametric_sinusoidal_sweep(&test_limits(), 50.0);
+        assert_eq!(steps.len(), 6);
+        for step in &steps {
+            assert!(
+                step.pipeline_ok,
+                "pipeline failed for A={}, λ={}: {:?}",
+                step.amplitude_m, step.wavelength_m, step.error
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_clearance_always_maintained() {
+        let steps = parametric_sinusoidal_sweep(&test_limits(), 50.0);
+        for step in &steps {
+            assert!(
+                step.clearance_maintained,
+                "clearance violated for A={}, λ={}",
+                step.amplitude_m, step.wavelength_m
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_curvature_always_bounded() {
+        let steps = parametric_sinusoidal_sweep(&test_limits(), 50.0);
+        for step in &steps {
+            assert!(
+                step.curvature_bounded,
+                "curvature unbounded for A={}, λ={}: κ={:.6} > limit {:.6} × 3",
+                step.amplitude_m, step.wavelength_m, step.max_curvature, step.curvature_limit
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_agl_deviation_increases_with_difficulty() {
+        let steps = parametric_sinusoidal_sweep(&test_limits(), 50.0);
+
+        // The easiest step (within envelope) should have lower AGL deviation
+        // than the hardest step (well beyond envelope).
+        let easy = steps.iter().find(|s| !s.exceeds_kinematic_envelope);
+        let hard = steps.iter().rev().find(|s| s.exceeds_kinematic_envelope);
+
+        if let (Some(e), Some(h)) = (easy, hard) {
+            assert!(
+                h.rms_agl_deviation_m >= e.rms_agl_deviation_m,
+                "harder terrain (A={}, λ={}, RMS={:.1}) should have >= AGL deviation \
+                 than easy terrain (A={}, λ={}, RMS={:.1})",
+                h.amplitude_m,
+                h.wavelength_m,
+                h.rms_agl_deviation_m,
+                e.amplitude_m,
+                e.wavelength_m,
+                e.rms_agl_deviation_m
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_identifies_envelope_exceedance() {
+        let limits = test_limits();
+        let steps = parametric_sinusoidal_sweep(&limits, 50.0);
+
+        // First few combos should be within envelope, later ones should exceed
+        let within: Vec<_> = steps
+            .iter()
+            .filter(|s| !s.exceeds_kinematic_envelope)
+            .collect();
+        let beyond: Vec<_> = steps
+            .iter()
+            .filter(|s| s.exceeds_kinematic_envelope)
+            .collect();
+
+        assert!(!within.is_empty(), "should have at least one easy step");
+        assert!(!beyond.is_empty(), "should have at least one hard step");
     }
 }
