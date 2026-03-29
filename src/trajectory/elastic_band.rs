@@ -20,8 +20,10 @@
  *
  * The solver operates on a 2D vertical slice: nodes are positioned at uniform
  * along-track distances, and only the altitude of each interior node is
- * adjusted. The endpoints are held fixed (they are the line start/end
- * altitudes set by the flight planner).
+ * adjusted. All nodes (including endpoints) are free to float — the
+ * solver produces a smooth profile without artificial boundary
+ * discontinuities. Entry/exit altitude matching is the responsibility
+ * of the flight line generator.
  *
  * Four energy terms drive the relaxation:
  *
@@ -54,6 +56,38 @@ use rayon::prelude::*;
 
 use crate::error::TrajectoryError;
 use crate::types::KinematicLimits;
+
+// ---------------------------------------------------------------------------
+// Floor mode
+// ---------------------------------------------------------------------------
+
+/// Strategy for computing the altitude floor that the elastic band must not
+/// penetrate. All modes enforce terrain + min_clearance as a hard safety
+/// minimum — the reference surface can only raise the floor, never lower it.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FloorMode {
+    /// Per-point terrain following: floor[i] = terrain[i] + clearance.
+    /// The band hugs the terrain contour. Standard for photogrammetric survey
+    /// where consistent GSD matters.
+    #[default]
+    TerrainFollowing,
+    /// Constant floor at mean terrain elevation + clearance.
+    /// Smooths over small-scale variation. Suitable for gently rolling terrain
+    /// where consistent absolute altitude is preferred over constant AGL.
+    MeanTerrain,
+    /// Constant floor at median terrain elevation + clearance.
+    /// More robust to outlier peaks/valleys than mean. Good for terrain with
+    /// isolated anomalies (towers, quarries).
+    MedianTerrain,
+    /// Constant floor at a fixed MSL altitude. Terrain clearance is still
+    /// enforced — the band rises above this altitude where terrain demands it.
+    /// Used for absolute altitude missions (e.g., airspace constraints).
+    FixedMsl(f64),
+    /// Constant floor at max(terrain) + clearance across the entire line.
+    /// Guarantees level flight above the highest point. Most conservative mode,
+    /// typical for obstacle-rich environments or when GSD variation is acceptable.
+    HighestPoint,
+}
 
 // ---------------------------------------------------------------------------
 // Spring constants
@@ -127,6 +161,8 @@ pub struct ElasticBandSolver {
     /// Minimum clearance above terrain (metres). This is the hard safety
     /// floor — no node will ever be placed below terrain + min_clearance.
     pub min_clearance_m: f64,
+    /// Strategy for computing the reference altitude floor.
+    pub floor_mode: FloorMode,
     /// Maximum gradient descent iterations before declaring non-convergence.
     pub max_iterations: usize,
     /// Convergence threshold (metres). The solver stops when the maximum
@@ -145,9 +181,55 @@ impl ElasticBandSolver {
             limits,
             springs: SpringConstants::default_survey(),
             min_clearance_m,
+            floor_mode: FloorMode::default(),
             max_iterations: 500,
             convergence_threshold_m: 0.01,
             learning_rate: 0.3,
+        }
+    }
+
+    /// Compute the altitude floor for each node based on the floor mode.
+    ///
+    /// The safety floor (terrain + min_clearance) is always enforced as
+    /// a hard minimum. The reference surface from the floor mode can only
+    /// raise the floor above this safety baseline.
+    fn compute_floor(&self, terrain: &[f64]) -> Vec<f64> {
+        let n = terrain.len();
+        let safety: Vec<f64> = terrain.iter().map(|t| t + self.min_clearance_m).collect();
+
+        match self.floor_mode {
+            FloorMode::TerrainFollowing => safety,
+
+            FloorMode::MeanTerrain => {
+                let mean = terrain.iter().sum::<f64>() / n as f64;
+                let ref_alt = mean + self.min_clearance_m;
+                safety.iter().map(|&s| s.max(ref_alt)).collect()
+            }
+
+            FloorMode::MedianTerrain => {
+                let mut sorted = terrain.to_vec();
+                // NaN-safe sort: NaN values sort to the end so they don't
+                // corrupt the median. Non-finite terrain is caught upstream
+                // by TerrainEngine, but we defend against it here too.
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+                let median = if n.is_multiple_of(2) {
+                    (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+                } else {
+                    sorted[n / 2]
+                };
+                let ref_alt = median + self.min_clearance_m;
+                safety.iter().map(|&s| s.max(ref_alt)).collect()
+            }
+
+            FloorMode::FixedMsl(alt) => safety.iter().map(|&s| s.max(alt)).collect(),
+
+            FloorMode::HighestPoint => {
+                let max_terrain = terrain.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let ref_alt = max_terrain + self.min_clearance_m;
+                // ref_alt >= terrain[i] + clearance for all i, so safety is
+                // always satisfied. Use a constant floor.
+                vec![ref_alt; n]
+            }
         }
     }
 
@@ -157,13 +239,12 @@ impl ElasticBandSolver {
     ///
     /// * `terrain_profile` — Slice of (along_track_m, terrain_elevation_m)
     ///   pairs. Must be sorted by along-track distance with uniform spacing.
-    ///   Minimum 3 points (2 fixed endpoints + 1 interior node).
+    ///   Minimum 3 points.
     ///
     /// # Returns
     ///
-    /// A vector of relaxed altitudes (same length as input). The first and
-    /// last values are the terrain elevation + min_clearance at the endpoints
-    /// (held fixed during relaxation).
+    /// A vector of relaxed altitudes (same length as input). All nodes
+    /// (including endpoints) are free to move during relaxation.
     pub fn solve(&self, terrain_profile: &[(f64, f64)]) -> Result<Vec<f64>, TrajectoryError> {
         let n = terrain_profile.len();
         if n < 3 {
@@ -180,14 +261,15 @@ impl ElasticBandSolver {
             ));
         }
 
-        // Extract terrain elevations and compute the clearance floor
+        // Extract terrain elevations and compute the mode-aware floor.
+        // The safety invariant (terrain + min_clearance) is always enforced
+        // inside compute_floor regardless of mode.
         let terrain: Vec<f64> = terrain_profile.iter().map(|p| p.1).collect();
-        let floor: Vec<f64> = terrain.iter().map(|t| t + self.min_clearance_m).collect();
+        let floor = self.compute_floor(&terrain);
 
-        // Initialize each node at the clearance floor (terrain + min_clearance).
-        // In a 2D vertical slice there are no overhangs, so the floor is always
-        // feasible. Starting at the floor minimizes the distance to equilibrium
-        // and dramatically improves convergence speed.
+        // Initialize each node at the floor. For TerrainFollowing this is
+        // terrain + min_clearance; for constant modes it is the reference
+        // altitude. Starting at the floor minimizes iterations to equilibrium.
         let mut alt: Vec<f64> = floor.clone();
 
         // Gradient descent — all nodes are free to move (including endpoints).
@@ -431,6 +513,150 @@ mod tests {
                 "segment {i}: slope {slope:.4} exceeds limit {max_slope:.4}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Floor mode tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mean_terrain_raises_valleys() {
+        // A valley profile: 500m at edges, dipping to 100m in the center.
+        // With MeanTerrain mode, the floor should be elevated over the valley
+        // compared to TerrainFollowing.
+        let min_clearance = 50.0;
+        let mut solver = make_solver(min_clearance);
+        solver.floor_mode = FloorMode::MeanTerrain;
+
+        // Build a valley profile: 500m at edges, dipping to 100m at center.
+        let n = 301;
+        let valley: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let x = i as f64 * 10.0;
+                let mid = 1500.0;
+                let t = (x - mid).abs() / mid; // 1 at edges, 0 at center
+                let elev = 100.0 + t * 400.0; // 500 at edges, 100 at center
+                (x, elev)
+            })
+            .collect();
+
+        let result = solver.solve(&valley).expect("should converge");
+
+        // Mean terrain is ~300m. Floor = 300 + 50 = 350m.
+        // At the valley center (terrain=100m), TerrainFollowing floor = 150m,
+        // but MeanTerrain floor = 350m. Result should be >= 350m at center.
+        let center = n / 2;
+        assert!(
+            result[center] >= 340.0,
+            "valley center alt {:.1} should be raised by mean floor",
+            result[center]
+        );
+    }
+
+    #[test]
+    fn median_terrain_robust_to_outlier() {
+        let min_clearance = 50.0;
+        let mut solver = make_solver(min_clearance);
+        solver.floor_mode = FloorMode::MedianTerrain;
+        solver.max_iterations = 2000;
+        solver.convergence_threshold_m = 0.2; // hill floor transition is steep
+
+        // Mostly flat at 200m with a hill rising to 500m over 40 nodes.
+        // Median stays near 200m, so mean-based floor would be higher.
+        let n = 301;
+        let hill_center = 150;
+        let hill_width = 40;
+        let terrain: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let x = i as f64 * 10.0;
+                let dist = (i as f64 - hill_center as f64).abs();
+                let elev = if dist < hill_width as f64 {
+                    let t = 1.0 - dist / hill_width as f64;
+                    200.0 + t * 300.0
+                } else {
+                    200.0
+                };
+                (x, elev)
+            })
+            .collect();
+
+        let result = solver.solve(&terrain).expect("should converge");
+
+        // Median ≈ 200m, so floor ≈ 250m for most nodes. Nodes far from the
+        // hill should not be inflated by the outlier.
+        let typical = result[20]; // far from the hill
+        assert!(
+            typical < 300.0,
+            "typical node {:.1} should not be inflated by outlier hill",
+            typical
+        );
+        // But the hill peak must still be cleared
+        assert!(
+            result[hill_center] >= 500.0 + min_clearance - 0.01,
+            "hill peak must still be cleared"
+        );
+    }
+
+    #[test]
+    fn fixed_msl_sets_constant_floor() {
+        let min_clearance = 50.0;
+        let mut solver = make_solver(min_clearance);
+        solver.floor_mode = FloorMode::FixedMsl(600.0);
+
+        // Terrain at 200m — well below the 600m MSL floor.
+        let profile = flat_terrain(200.0, 3000.0, 10.0);
+        let result = solver.solve(&profile).expect("should converge");
+
+        // All nodes should be at or above 600m (not 200+50=250m).
+        for (i, &alt) in result.iter().enumerate() {
+            assert!(
+                alt >= 599.9,
+                "node {i}: alt {alt:.1} below fixed MSL floor 600"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_msl_still_clears_terrain() {
+        let min_clearance = 50.0;
+        let mut solver = make_solver(min_clearance);
+        solver.floor_mode = FloorMode::FixedMsl(300.0);
+
+        // Terrain peaks at 500m — above the 300m MSL floor.
+        // Safety floor (500+50=550) must override the MSL floor.
+        let profile = peak_terrain(100.0, 500.0, 3000.0, 10.0);
+        let result = solver.solve(&profile).expect("should converge");
+
+        for (i, (&alt, &(_, terrain))) in result.iter().zip(profile.iter()).enumerate() {
+            let safety = terrain + min_clearance;
+            assert!(
+                alt >= safety - 0.01,
+                "node {i}: alt {alt:.2} below safety floor {safety:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn highest_point_produces_level_flight() {
+        let min_clearance = 50.0;
+        let mut solver = make_solver(min_clearance);
+        solver.floor_mode = FloorMode::HighestPoint;
+
+        let profile = peak_terrain(100.0, 500.0, 3000.0, 10.0);
+        let result = solver.solve(&profile).expect("should converge");
+
+        // Floor is 500 + 50 = 550m everywhere. All nodes should be near 550m.
+        let max_alt = result.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min_alt = result.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            max_alt - min_alt < 20.0,
+            "HighestPoint should produce near-level flight, got spread {:.1}m",
+            max_alt - min_alt
+        );
+        assert!(
+            min_alt >= 549.9,
+            "min altitude {min_alt:.1} below expected floor 550"
+        );
     }
 
     #[test]

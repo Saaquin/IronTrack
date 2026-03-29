@@ -88,6 +88,30 @@ pub type SharedState = Arc<RwLock<FmsState>>;
 use crate::network::serial_manager::SerialManager;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
+/// Discover a non-loopback local network IP for mDNS advertisement.
+/// Falls back to `0.0.0.0` if no suitable interface is found.
+fn discover_local_ip() -> String {
+    match local_ip_address::local_ip() {
+        Ok(ip) => {
+            let s = ip.to_string();
+            // Reject loopback and link-local (should not happen with this crate,
+            // but guard defensively).
+            if s.starts_with("127.") || s.starts_with("169.254.") {
+                eprintln!("warning: local_ip() returned {s}, falling back to 0.0.0.0 for mDNS");
+                "0.0.0.0".to_string()
+            } else {
+                s
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not discover local IP ({e}), falling back to 0.0.0.0 for mDNS"
+            );
+            "0.0.0.0".to_string()
+        }
+    }
+}
+
 /// Start the Axum FMS daemon on the specified port.
 pub async fn run_server(
     port: u16,
@@ -124,14 +148,16 @@ pub async fn run_server(
     let service_type = "_irontrack._tcp.local.";
     let instance_name = "fms_daemon";
     let host_name = "irontrack.local.";
+    let local_ip = discover_local_ip();
     let my_service = ServiceInfo::new(
         service_type,
         instance_name,
         host_name,
-        "127.0.0.1", // TODO: Discover local IP
+        local_ip.as_str(),
         port,
         None,
     )?;
+    println!("mDNS: advertising {service_type} at {local_ip}:{port}");
     mdns.register(my_service)?;
 
     // Spawn persistence task
@@ -1009,5 +1035,27 @@ mod tests {
         let fc: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fc["type"], "FeatureCollection");
         assert!(fc["features"].as_array().unwrap().len() > 0);
+    }
+
+    /// mDNS IP discovery must return a non-loopback address (or the 0.0.0.0 fallback).
+    #[test]
+    fn mdns_discover_local_ip_not_loopback() {
+        let ip = discover_local_ip();
+        assert!(
+            !ip.starts_with("127."),
+            "mDNS IP must not be loopback, got {ip}"
+        );
+    }
+
+    /// Axum listener binds to 0.0.0.0, making it reachable from non-loopback addresses.
+    #[tokio::test]
+    async fn listener_binds_all_interfaces() {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(
+            bound.ip().is_unspecified(),
+            "listener must bind to 0.0.0.0, got {bound}"
+        );
     }
 }

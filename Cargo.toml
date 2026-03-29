@@ -37,6 +37,7 @@ futures-util = "0.3"
 serialport = { version = "4", optional = true }
 tokio-serial = { version = "5", optional = true }
 mdns-sd = "0.13"
+local-ip-address = "0.6"
 nalgebra = "0.33"
 
 [patch.crates-io]
