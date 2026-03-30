@@ -51,4 +51,5 @@ egm96 = { path = "vendor/egm96" }
 [dev-dependencies]
 approx = "0.5"
 flate2 = "1"
+serial_test = "3"
 tokio-tungstenite = "0.24"

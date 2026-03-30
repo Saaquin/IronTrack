@@ -651,8 +651,11 @@ async fn create_mission(
                 };
                 plan.lines.len()
             ];
-            let status_clone = state_guard.last_status.clone();
-            let _ = state_guard.tx_status.send(status_clone);
+            // Use send_modify to unconditionally update the watch channel.
+            // watch::Sender::send() may silently discard the value when no
+            // receivers are subscribed; send_modify always writes.
+            let fresh_status = state_guard.last_status.clone();
+            state_guard.tx_status.send_modify(|s| *s = fresh_status);
 
             let summary = calculate_mission_summary(&state_guard)?;
             Ok(Json(summary))
@@ -706,8 +709,8 @@ async fn update_line(
     }
 
     state_guard.last_status.line_statuses[line_id] = status;
-    let status_clone = state_guard.last_status.clone();
-    let _ = state_guard.tx_status.send(status_clone);
+    let fresh = state_guard.last_status.clone();
+    state_guard.tx_status.send_modify(|s| *s = fresh);
     Ok(StatusCode::OK)
 }
 
@@ -755,8 +758,8 @@ async fn delete_line(
         }
 
         // Broadcast updated status
-        let status_clone = state.last_status.clone();
-        let _ = state.tx_status.send(status_clone);
+        let fresh = state.last_status.clone();
+        state.tx_status.send_modify(|s| *s = fresh);
 
         let summary = calculate_mission_summary(&state)?;
         let pool_clone = state.db_pool.clone();
@@ -1123,8 +1126,8 @@ async fn handle_client_msg(text: String, state: &SharedState) {
                 for (i, status) in state_guard.last_status.line_statuses.iter_mut().enumerate() {
                     status.is_active = i == index;
                 }
-                let status_clone = state_guard.last_status.clone();
-                let _ = state_guard.tx_status.send(status_clone);
+                let fresh = state_guard.last_status.clone();
+                state_guard.tx_status.send_modify(|s| *s = fresh);
             }
         }
     }
@@ -1351,8 +1354,8 @@ pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
                     };
                 }
                 guard.last_status.active_line_index = Some(line_idx);
-                let status_clone = guard.last_status.clone();
-                let _ = guard.tx_status.send(status_clone);
+                let fresh = guard.last_status.clone();
+                guard.tx_status.send_modify(|s| *s = fresh);
             }
 
             prev_line_idx = Some(line_idx);
