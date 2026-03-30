@@ -10,6 +10,13 @@ This wiki is the human-readable layer above the 52 research documents in `docs/`
 - [Maintainer Guide](maintainers.md) — Architecture, coding conventions, and the roadmap through v1.0.
 - [User Guide (Early Adopters)](early-adopters.md) — CLI usage examples, daemon mode, and current limitations.
 
+## Feature Guides
+
+- [Geodesy & Datums](geodesy-and-datums) — Karney geodesics, UTM projection, EGM96/EGM2008 geoid models, PhantomData datum safety, altitude conversions.
+- [Terrain & Trajectory](terrain-and-trajectory) — Copernicus DEM ingestion, Two-Phase I/O, Elastic Band + B-spline smoothing, pure pursuit, terrain-following pipeline.
+- [Flight Planning](flight-planning) — Area surveys, corridor mapping, LiDAR missions, sensor geometry, Dubins turns, TSP route optimization.
+- [Daemon & API](daemon-and-api) — REST endpoints, WebSocket telemetry, NMEA parsing, serial manager, mDNS discovery, state management.
+
 ## Current Engine State (v0.3.1)
 
 The IronTrack Core Engine is a high-performance headless CLI and networked daemon built in Rust (~40,000 lines across 44 source files). Current capabilities:
