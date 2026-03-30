@@ -142,7 +142,8 @@ impl GeoPackage {
             "PRAGMA journal_mode = WAL;\
              PRAGMA synchronous = NORMAL;\
              PRAGMA cache_size = -64000;\
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;\
+             PRAGMA busy_timeout = 0;",
         )?;
         Ok(())
     }
@@ -614,6 +615,40 @@ impl GeoPackage {
             for (idx, pct) in statuses {
                 stmt.execute(params![pct, *idx as i64])?;
             }
+            Ok::<(), GpkgError>(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete a single flight line by `line_index` and re-index remaining lines.
+    ///
+    /// After deletion, all lines with `line_index > deleted_index` are decremented
+    /// by 1 to maintain a contiguous zero-based sequence. Both the feature table
+    /// and R-tree are updated within a single transaction (R-tree triggers fire
+    /// automatically on DELETE/UPDATE).
+    pub fn delete_line(&self, table_name: &str, line_index: usize) -> Result<(), GpkgError> {
+        validate_identifier(table_name)?;
+        self.conn.execute_batch("BEGIN;")?;
+        let result = (|| {
+            self.conn.execute(
+                &format!("DELETE FROM {table_name} WHERE line_index = ?1"),
+                params![line_index as i64],
+            )?;
+            self.conn.execute(
+                &format!(
+                    "UPDATE {table_name} SET line_index = line_index - 1 WHERE line_index > ?1"
+                ),
+                params![line_index as i64],
+            )?;
             Ok::<(), GpkgError>(())
         })();
         match result {

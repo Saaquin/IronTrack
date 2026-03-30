@@ -55,3 +55,17 @@ pub struct LineStatus {
     pub completion_pct: f64,
     pub is_active: bool,
 }
+
+/// A single sensor trigger event recorded during flight execution.
+///
+/// Stored in a bounded in-memory ring buffer (`VecDeque`, 10 000 max)
+/// and broadcast to WebSocket clients for real-time trigger confirmation.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TriggerEvent {
+    pub timestamp_ms: u64,
+    pub line_index: usize,
+    pub waypoint_index: usize,
+    pub lat: f64,
+    pub lon: f64,
+    pub alt: f64,
+}

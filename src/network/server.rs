@@ -16,24 +16,30 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderValue, Method, Request, StatusCode},
+    middleware,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, watch, RwLock};
+use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 
 use crate::dem::TerrainEngine;
 use crate::gpkg::GeoPackage;
-use crate::network::telemetry::{CurrentState, LineStatus, SystemStatus};
+use crate::network::errors::ServerError;
+use crate::network::telemetry::{CurrentState, LineStatus, SystemStatus, TriggerEvent};
 use crate::photogrammetry::FlightPlan;
 use crate::types::{AltitudeDatum, FlightLine};
 
@@ -47,6 +53,14 @@ use crate::photogrammetry::flightlines::{
 };
 use crate::photogrammetry::lidar::LidarSensorParams;
 use crate::photogrammetry::resolve_sensor;
+
+#[cfg(feature = "serial")]
+use crate::network::serial_manager::SerialManager;
+use mdns_sd::{ServiceDaemon, ServiceInfo};
+
+// ---------------------------------------------------------------------------
+// State types
+// ---------------------------------------------------------------------------
 
 /// Global state for the FMS daemon.
 pub struct FmsState {
@@ -63,6 +77,12 @@ pub struct FmsState {
 
     // Persistence
     pub persistence_path: Option<PathBuf>,
+
+    // Mission tracking
+    pub mission_id: Option<u64>,
+    pub mission_counter: u64,
+    pub trigger_log: VecDeque<TriggerEvent>,
+    pub db_pool: Option<deadpool_sqlite::Pool>,
 }
 
 impl FmsState {
@@ -78,15 +98,114 @@ impl FmsState {
             last_telemetry: CurrentState::default(),
             last_status: SystemStatus::default(),
             persistence_path: None,
+            mission_id: None,
+            mission_counter: 0,
+            trigger_log: VecDeque::new(),
+            db_pool: None,
         })
     }
 }
 
 pub type SharedState = Arc<RwLock<FmsState>>;
 
-#[cfg(feature = "serial")]
-use crate::network::serial_manager::SerialManager;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+/// Application-level state carried through the Axum router.
+///
+/// Wraps the shared FMS state plus the per-session bearer token used
+/// by the auth middleware and WebSocket upgrade handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub fms: SharedState,
+    pub token: Arc<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Token generation
+// ---------------------------------------------------------------------------
+
+/// Resolve the bearer token for this session.
+///
+/// Uses `IRONTRACK_TOKEN` from the environment if set and non-empty;
+/// otherwise generates 32 cryptographically random bytes rendered as hex.
+fn resolve_bearer_token() -> String {
+    if let Ok(token) = std::env::var("IRONTRACK_TOKEN") {
+        if !token.is_empty() {
+            return token;
+        }
+    }
+    let mut bytes = [0u8; 32];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+/// Axum middleware that enforces bearer-token authentication on REST routes.
+///
+/// Extracts the `Authorization: Bearer <token>` header and performs a
+/// constant-time comparison (via `subtle::ConstantTimeEq`) to prevent
+/// timing side-channels.  Returns a `401 Unauthorized` JSON error on
+/// missing or invalid tokens.
+async fn auth_middleware(
+    State(app): State<AppState>,
+    req: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    let auth_header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match auth_header {
+        Some(token) => {
+            let expected = app.token.as_bytes();
+            let provided = token.as_bytes();
+            if expected.len() == provided.len() && bool::from(expected.ct_eq(provided)) {
+                next.run(req).await
+            } else {
+                ServerError::Unauthorized("invalid bearer token".into()).into_response()
+            }
+        }
+        None => ServerError::Unauthorized("missing Authorization header".into()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CORS construction
+// ---------------------------------------------------------------------------
+
+/// Build a restrictive CORS layer that allows the server's own origin,
+/// common dev-server ports, and any extra origins passed via CLI.
+fn build_cors_layer(port: u16, extra_origins: &[String]) -> CorsLayer {
+    let default_origins = [
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+        "http://localhost:3000".into(),
+        "http://localhost:5173".into(),
+        "http://127.0.0.1:3000".into(),
+        "http://127.0.0.1:5173".into(),
+    ];
+    let mut origins: Vec<HeaderValue> = default_origins
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    for origin in extra_origins {
+        if let Ok(val) = origin.parse::<HeaderValue>() {
+            origins.push(val);
+        }
+    }
+    origins.dedup();
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+}
+
+// ---------------------------------------------------------------------------
+// mDNS helper
+// ---------------------------------------------------------------------------
 
 /// Discover a non-loopback local network IP for mDNS advertisement.
 /// Falls back to `0.0.0.0` if no suitable interface is found.
@@ -112,12 +231,53 @@ fn discover_local_ip() -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Connection pool helper
+// ---------------------------------------------------------------------------
+
+/// Create a deadpool-sqlite connection pool for the given GeoPackage path.
+///
+/// Each connection returned by the pool must have session-level PRAGMAs
+/// applied before use.  Because deadpool-sqlite 0.8 does not expose a
+/// convenient post-create hook through the config builder, we apply
+/// PRAGMAs inside each `interact()` call via [`apply_pool_pragmas`].
+/// The PRAGMAs are idempotent and fast (~0.1 ms), so the overhead is
+/// negligible for the 5-second persistence loop.
+fn create_gpkg_pool(path: &std::path::Path) -> anyhow::Result<deadpool_sqlite::Pool> {
+    let cfg = deadpool_sqlite::Config::new(path.to_string_lossy().to_string());
+    let pool = cfg.create_pool(deadpool_sqlite::Runtime::Tokio1)?;
+    Ok(pool)
+}
+
+/// Session-level PRAGMAs that must be set on every pool connection.
+///
+/// WAL mode is file-level (persisted by `GeoPackage::new()`), but
+/// `synchronous`, `cache_size`, `foreign_keys`, and `busy_timeout`
+/// are connection-level and reset when the connection is recycled.
+///
+/// SQLITE_BUSY (busy_timeout = 0) is a fatal architectural violation
+/// [Doc 42] — we never retry, we fail fast.
+fn apply_pool_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;\
+         PRAGMA synchronous = NORMAL;\
+         PRAGMA cache_size = -64000;\
+         PRAGMA foreign_keys = ON;\
+         PRAGMA busy_timeout = 0;",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Server entry point
+// ---------------------------------------------------------------------------
+
 /// Start the Axum FMS daemon on the specified port.
 pub async fn run_server(
     port: u16,
     mock_speed: Option<f64>,
     gnss_vid: u16,
     gnss_pid: u16,
+    cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(RwLock::new(FmsState::new()?));
 
@@ -168,17 +328,39 @@ pub async fn run_server(
 
     let shutdown_state = state.clone();
 
+    // Generate session token
+    let token = resolve_bearer_token();
+    println!("Session token: {token}");
+
+    let app_state = AppState {
+        fms: state,
+        token: Arc::new(token),
+    };
+
+    let cors_layer = build_cors_layer(port, &cors_origins);
+
+    // REST routes behind auth middleware
+    let rest = Router::new()
+        .route("/api/v1/missions", post(create_mission))
+        .route("/api/v1/missions/:id", get(get_mission))
+        .route("/api/v1/missions/:id/lines", get(get_lines))
+        .route(
+            "/api/v1/missions/:id/lines/:line_id",
+            put(update_line).delete(delete_line),
+        )
+        .route("/api/v1/missions/:id/export/gpkg", get(export_gpkg))
+        .route("/api/v1/missions/:id/export/qgc", get(export_qgc))
+        .route("/api/v1/missions/:id/export/dji", get(export_dji))
+        .route_layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            auth_middleware,
+        ));
+
     let app = Router::new()
-        .route("/api/v1/mission/load", post(load_mission))
-        .route("/api/v1/mission/plan", get(get_plan))
-        .route("/api/v1/mission/lines/:index", put(update_line))
-        .route("/api/v1/mission/export/qgc", get(export_qgc))
-        .route("/api/v1/mission/export/dji", get(export_dji))
+        .merge(rest)
         .route("/ws", get(ws_handler))
-        // TODO: restrict CORS origin before any network-exposed deployment.
-        // CorsLayer::permissive() is acceptable for local dev only.
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .layer(cors_layer)
+        .with_state(app_state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -196,12 +378,24 @@ pub async fn run_server(
     // Architecture rule: VACUUM is prohibited; PRAGMA optimize is the
     // required shutdown-time maintenance action.
     //
-    // Note: the background persistence task may still hold an open connection.
-    // In WAL mode concurrent readers are safe, but wal_checkpoint(TRUNCATE)
-    // requires exclusive access. If SQLITE_BUSY occurs, the database remains
-    // consistent — only the WAL file isn't truncated. This is best-effort.
+    // Prefer the connection pool if available — it honours WAL mode and
+    // avoids opening a second direct connection.
     let state_guard = shutdown_state.read().await;
-    if let Some(ref path) = state_guard.persistence_path {
+    if let Some(ref pool) = state_guard.db_pool {
+        let pool = pool.clone();
+        drop(state_guard);
+        match pool.get().await {
+            Ok(conn) => {
+                let _ = conn
+                    .interact(|conn| {
+                        conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")
+                    })
+                    .await;
+            }
+            Err(e) => log::error!("could not get pool connection for shutdown: {e}"),
+        }
+    } else if let Some(ref path) = state_guard.persistence_path {
+        // Fallback: direct connection if pool is not available.
         match GeoPackage::open(path) {
             Ok(gpkg) => {
                 if let Err(e) = gpkg
@@ -315,8 +509,9 @@ fn default_datum() -> String {
     "egm2008".into()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MissionSummaryResponse {
+    pub id: u64,
     pub line_count: usize,
     pub waypoint_count: usize,
     pub total_distance_km: f64,
@@ -324,83 +519,691 @@ pub struct MissionSummaryResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/// Validate that the requested mission ID matches the currently loaded mission.
+fn validate_mission_id(state: &FmsState, id: u64) -> Result<(), ServerError> {
+    match state.mission_id {
+        Some(mid) if mid == id => Ok(()),
+        _ => Err(ServerError::MissionNotFound(id)),
+    }
+}
+
+/// Build a [`MissionSummaryResponse`] from the current in-memory state.
+fn calculate_mission_summary(state: &FmsState) -> Result<MissionSummaryResponse, ServerError> {
+    let plan = state.flight_plan.as_ref().ok_or(ServerError::NoMission)?;
+    let id = state.mission_id.ok_or(ServerError::NoMission)?;
+    let line_count = plan.lines.len();
+    let waypoint_count: usize = plan.lines.iter().map(|l| l.len()).sum();
+    let total_distance_km = calculate_total_distance(plan);
+
+    let mut min_lat = f64::INFINITY;
+    let mut min_lon = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    for line in &plan.lines {
+        for i in 0..line.len() {
+            let lat = line.lats()[i].to_degrees();
+            let lon = line.lons()[i].to_degrees();
+            min_lat = min_lat.min(lat);
+            min_lon = min_lon.min(lon);
+            max_lat = max_lat.max(lat);
+            max_lon = max_lon.max(lon);
+        }
+    }
+
+    Ok(MissionSummaryResponse {
+        id,
+        line_count,
+        waypoint_count,
+        total_distance_km,
+        bbox: [min_lat, min_lon, max_lat, max_lon],
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn load_mission(
-    State(state): State<SharedState>,
+/// POST /api/v1/missions — create a new mission from planning parameters.
+///
+/// Generates the flight plan (area or corridor), persists it to a GeoPackage,
+/// creates a connection pool, and returns a mission summary.
+async fn create_mission(
+    State(app): State<AppState>,
     Json(req): Json<LoadMissionRequest>,
-) -> impl IntoResponse {
-    let terrain_engine = state.read().await.terrain_engine.clone();
+) -> Result<Json<MissionSummaryResponse>, ServerError> {
+    let terrain_engine = app.fms.read().await.terrain_engine.clone();
 
-    let result =
-        tokio::task::spawn_blocking(move || generate_plan_internal(req, &terrain_engine)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let plan = generate_plan_internal(req, &terrain_engine)?;
+
+        // Persist to GeoPackage inside the same spawn_blocking — all
+        // GeoPackage I/O is synchronous rusqlite calls.
+        let gpkg_path = PathBuf::from("mission.gpkg");
+        // Remove any prior GeoPackage to avoid stale data from previous missions.
+        // GeoPackage::new creates a fresh file; IF NOT EXISTS + insert would otherwise
+        // append into the existing table, corrupting line_index uniqueness.
+        let _ = std::fs::remove_file(&gpkg_path);
+        let gpkg = GeoPackage::new(&gpkg_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        gpkg.create_feature_table("flight_lines")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        gpkg.insert_flight_plan("flight_lines", &plan)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        Ok::<(FlightPlan, PathBuf), anyhow::Error>((plan, gpkg_path))
+    })
+    .await;
 
     match result {
-        Ok(Ok(plan)) => {
-            let mut state_guard = state.write().await;
-
-            let line_count = plan.lines.len();
-            let waypoint_count: usize = plan.lines.iter().map(|l| l.len()).sum();
-
-            let total_distance_km = calculate_total_distance(&plan);
-
-            let mut min_lat = f64::INFINITY;
-            let mut min_lon = f64::INFINITY;
-            let mut max_lat = f64::NEG_INFINITY;
-            let mut max_lon = f64::NEG_INFINITY;
-            for line in &plan.lines {
-                for i in 0..line.len() {
-                    let lat = line.lats()[i].to_degrees();
-                    let lon = line.lons()[i].to_degrees();
-                    min_lat = min_lat.min(lat);
-                    min_lon = min_lon.min(lon);
-                    max_lat = max_lat.max(lat);
-                    max_lon = max_lon.max(lon);
-                }
-            }
+        Ok(Ok((plan, gpkg_path))) => {
+            let mut state_guard = app.fms.write().await;
 
             state_guard.flight_plan = Some(plan.clone());
 
-            // Initialize persistence
-            let gpkg_path = PathBuf::from("mission.gpkg");
-            if let Ok(gpkg) = GeoPackage::new(&gpkg_path) {
-                if let Ok(()) = gpkg.create_feature_table("flight_lines") {
-                    let _ = gpkg.insert_flight_plan("flight_lines", &plan);
+            // Increment mission counter and assign ID
+            state_guard.mission_counter += 1;
+            state_guard.mission_id = Some(state_guard.mission_counter);
+
+            // Create connection pool for ongoing DB access
+            match create_gpkg_pool(&gpkg_path) {
+                Ok(pool) => {
+                    state_guard.db_pool = Some(pool);
+                }
+                Err(e) => {
+                    log::warn!("failed to create connection pool: {e}");
+                    state_guard.db_pool = None;
                 }
             }
+
             state_guard.persistence_path = Some(gpkg_path);
+
+            // Clear trigger log for new mission
+            state_guard.trigger_log.clear();
 
             // Initialize line statuses
             state_guard.last_status.line_statuses = vec![
                 LineStatus {
                     completion_pct: 0.0,
-                    is_active: false
+                    is_active: false,
                 };
                 plan.lines.len()
             ];
             let status_clone = state_guard.last_status.clone();
             let _ = state_guard.tx_status.send(status_clone);
 
-            Json(MissionSummaryResponse {
-                line_count,
-                waypoint_count,
-                total_distance_km,
-                bbox: [min_lat, min_lon, max_lat, max_lon],
-            })
-            .into_response()
+            let summary = calculate_mission_summary(&state_guard)?;
+            Ok(Json(summary))
         }
-        Ok(Err(e)) => (StatusCode::BAD_REQUEST, format!("Error: {e}")).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal Error: {e}"),
-        )
-            .into_response(),
+        Ok(Err(e)) => Err(ServerError::PlanGeneration(e.to_string())),
+        Err(e) => Err(ServerError::Internal(e.to_string())),
     }
 }
 
+/// GET /api/v1/missions/:id — retrieve the current mission summary.
+async fn get_mission(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Json<MissionSummaryResponse>, ServerError> {
+    let state = app.fms.read().await;
+    validate_mission_id(&state, id)?;
+    Ok(Json(calculate_mission_summary(&state)?))
+}
+
+/// GET /api/v1/missions/:id/lines — return flight lines as GeoJSON.
+async fn get_lines(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Response, ServerError> {
+    let state = app.fms.read().await;
+    validate_mission_id(&state, id)?;
+    match state.flight_plan.as_ref() {
+        Some(plan) => Ok(Json(crate::io::geojson::flight_plan_to_geojson(
+            plan, None, None, None,
+        ))
+        .into_response()),
+        None => Err(ServerError::NoMission),
+    }
+}
+
+/// PUT /api/v1/missions/:id/lines/:line_id — update a single line's status.
+async fn update_line(
+    State(app): State<AppState>,
+    axum::extract::Path((id, line_id)): axum::extract::Path<(u64, usize)>,
+    Json(status): Json<LineStatus>,
+) -> Result<StatusCode, ServerError> {
+    let mut state_guard = app.fms.write().await;
+    validate_mission_id(&state_guard, id)?;
+
+    if state_guard.flight_plan.is_none() {
+        return Err(ServerError::NoMission);
+    }
+
+    if line_id >= state_guard.last_status.line_statuses.len() {
+        return Err(ServerError::LineNotFound(line_id));
+    }
+
+    state_guard.last_status.line_statuses[line_id] = status;
+    let status_clone = state_guard.last_status.clone();
+    let _ = state_guard.tx_status.send(status_clone);
+    Ok(StatusCode::OK)
+}
+
+/// DELETE /api/v1/missions/:id/lines/:line_id — remove a flight line.
+///
+/// Adjusts the active-line index so in-flight guidance stays consistent:
+/// - If the deleted line IS the active line, active becomes `None`.
+/// - If the deleted line is BEFORE the active line, active shifts down by 1.
+/// - If the deleted line is AFTER the active line, active is unchanged.
+///
+/// GeoPackage cleanup runs asynchronously after the write lock is released;
+/// if it fails, in-memory state is authoritative and a warning is logged.
+async fn delete_line(
+    State(app): State<AppState>,
+    axum::extract::Path((id, line_id)): axum::extract::Path<(u64, usize)>,
+) -> Result<Json<MissionSummaryResponse>, ServerError> {
+    let (summary, pool_clone, line_idx) = {
+        let mut state = app.fms.write().await;
+        validate_mission_id(&state, id)?;
+
+        let plan = state.flight_plan.as_mut().ok_or(ServerError::NoMission)?;
+        if line_id >= plan.lines.len() {
+            return Err(ServerError::LineNotFound(line_id));
+        }
+
+        plan.lines.remove(line_id);
+
+        // Adjust active_line_index
+        if let Some(active) = state.last_status.active_line_index {
+            if active == line_id {
+                state.last_status.active_line_index = None;
+            } else if active > line_id {
+                state.last_status.active_line_index = Some(active - 1);
+            }
+        }
+
+        // Remove line status entry
+        if line_id < state.last_status.line_statuses.len() {
+            state.last_status.line_statuses.remove(line_id);
+        }
+        // Update is_active flags to match new active_line_index
+        let current_active = state.last_status.active_line_index;
+        for (i, ls) in state.last_status.line_statuses.iter_mut().enumerate() {
+            ls.is_active = current_active == Some(i);
+        }
+
+        // Broadcast updated status
+        let status_clone = state.last_status.clone();
+        let _ = state.tx_status.send(status_clone);
+
+        let summary = calculate_mission_summary(&state)?;
+        let pool_clone = state.db_pool.clone();
+        (summary, pool_clone, line_id)
+    };
+    // Write lock is released here.
+
+    // Synchronous GeoPackage cleanup — ensures DB matches in-memory state
+    // before responding, so export_gpkg cannot serve stale data.
+    if let Some(pool) = pool_clone {
+        match pool.get().await {
+            Ok(conn) => {
+                let result = conn
+                    .interact(move |conn| {
+                        apply_pool_pragmas(conn)?;
+                        conn.execute_batch("BEGIN;")?;
+                        let del_result = (|| {
+                            conn.execute(
+                                "DELETE FROM flight_lines WHERE line_index = ?1",
+                                rusqlite::params![line_idx as i64],
+                            )?;
+                            conn.execute(
+                                "UPDATE flight_lines SET line_index = line_index - 1 \
+                                 WHERE line_index > ?1",
+                                rusqlite::params![line_idx as i64],
+                            )?;
+                            Ok::<(), rusqlite::Error>(())
+                        })();
+                        match del_result {
+                            Ok(()) => {
+                                conn.execute_batch("COMMIT;")?;
+                                Ok(())
+                            }
+                            Err(e) => {
+                                let _ = conn.execute_batch("ROLLBACK;");
+                                Err(e)
+                            }
+                        }
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!("delete_line DB cleanup failed: {e}"),
+                    Err(e) => log::warn!("delete_line interact failed: {e}"),
+                }
+            }
+            Err(e) => log::warn!("delete_line pool.get() failed: {e}"),
+        }
+    }
+
+    Ok(Json(summary))
+}
+
+/// GET /api/v1/missions/:id/export/gpkg — stream the GeoPackage file.
+///
+/// Runs a WAL checkpoint (PASSIVE) before streaming so the client
+/// receives a consistent snapshot.
+async fn export_gpkg(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Response, ServerError> {
+    let state = app.fms.read().await;
+    validate_mission_id(&state, id)?;
+    let path = state
+        .persistence_path
+        .clone()
+        .ok_or_else(|| ServerError::ExportFailed("no GeoPackage file".into()))?;
+    let pool = state.db_pool.clone();
+    drop(state);
+
+    // WAL checkpoint before streaming for a consistent snapshot.
+    if let Some(pool) = pool {
+        match pool.get().await {
+            Ok(conn) => {
+                let result = conn
+                    .interact(|conn| conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);"))
+                    .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!("export_gpkg WAL checkpoint failed: {e}"),
+                    Err(e) => log::warn!("export_gpkg interact failed: {e}"),
+                }
+            }
+            Err(e) => log::warn!("export_gpkg pool.get() failed: {e}"),
+        }
+    }
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ServerError::ExportFailed(e.to_string()))?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/geopackage+sqlite3"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"mission.gpkg\"",
+            ),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+/// GET /api/v1/missions/:id/export/qgc — export as QGroundControl JSON.
+async fn export_qgc(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Response, ServerError> {
+    let terrain_engine = {
+        let state = app.fms.read().await;
+        validate_mission_id(&state, id)?;
+        state.terrain_engine.clone()
+    };
+    let plan = {
+        let state = app.fms.read().await;
+        state.flight_plan.as_ref().cloned()
+    };
+
+    let plan = plan.ok_or(ServerError::NoMission)?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let qgc_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+        let needs_conversion =
+            qgc_datum != AltitudeDatum::Agl && qgc_datum != AltitudeDatum::Wgs84Ellipsoidal;
+
+        let mut qgc_plan = plan;
+        if needs_conversion {
+            let mut converted = Vec::with_capacity(qgc_plan.lines.len());
+            for line in qgc_plan.lines {
+                converted.push(line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &terrain_engine)?);
+            }
+            qgc_plan.lines = converted;
+        }
+
+        let trigger_dist = qgc_plan.params.photo_interval();
+        let json = crate::io::qgc::flight_plan_to_qgc(&qgc_plan, trigger_dist);
+        Ok::<serde_json::Value, anyhow::Error>(json)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(json)) => Ok(Json(json).into_response()),
+        Ok(Err(e)) => Err(ServerError::ExportFailed(e.to_string())),
+        Err(e) => Err(ServerError::Internal(e.to_string())),
+    }
+}
+
+/// GET /api/v1/missions/:id/export/dji — export as DJI KMZ.
+async fn export_dji(
+    State(app): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<Response, ServerError> {
+    let terrain_engine = {
+        let state = app.fms.read().await;
+        validate_mission_id(&state, id)?;
+        state.terrain_engine.clone()
+    };
+    let plan = {
+        let state = app.fms.read().await;
+        state.flight_plan.as_ref().cloned()
+    };
+
+    let plan = plan.ok_or(ServerError::NoMission)?;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let dji_datum = plan
+            .lines
+            .first()
+            .map(|l| l.altitude_datum)
+            .unwrap_or(AltitudeDatum::Egm2008);
+
+        let mut dji_plan = plan;
+        if dji_datum != AltitudeDatum::Egm96 {
+            let mut converted = Vec::with_capacity(dji_plan.lines.len());
+            for line in dji_plan.lines {
+                converted.push(line.to_datum(AltitudeDatum::Egm96, &terrain_engine)?);
+            }
+            dji_plan.lines = converted;
+        }
+
+        let bytes = crate::io::dji::build_dji_kmz(&dji_plan)?;
+        Ok::<Vec<u8>, anyhow::Error>(bytes)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(bytes)) => Ok((
+            [
+                (header::CONTENT_TYPE, "application/vnd.google-earth.kmz"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"mission.kmz\"",
+                ),
+            ],
+            bytes,
+        )
+            .into_response()),
+        Ok(Err(e)) => Err(ServerError::ExportFailed(e.to_string())),
+        Err(e) => Err(ServerError::Internal(e.to_string())),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct WsParams {
+    pub token: Option<String>,
+}
+
+/// WebSocket upgrade handler.
+///
+/// Validates the token from the `?token=` query parameter using
+/// constant-time comparison before upgrading the connection.
+/// WebSocket lives outside the REST auth middleware — it authenticates
+/// via the query parameter instead.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<WsParams>,
+    State(app): State<AppState>,
+) -> Result<Response, ServerError> {
+    match params.token {
+        Some(ref token) => {
+            let expected = app.token.as_bytes();
+            let provided = token.as_bytes();
+            if expected.len() == provided.len() && bool::from(expected.ct_eq(provided)) {
+                let fms = app.fms.clone();
+                Ok(ws.on_upgrade(|socket| handle_socket(socket, fms)))
+            } else {
+                Err(ServerError::Unauthorized("invalid WebSocket token".into()))
+            }
+        }
+        None => Err(ServerError::Unauthorized(
+            "missing token query parameter".into(),
+        )),
+    }
+}
+
+async fn handle_socket(mut socket: WebSocket, state: SharedState) {
+    let initial_status = {
+        let state_guard = state.read().await;
+        let status = state_guard.tx_status.borrow().clone();
+        status
+    };
+
+    if let Ok(msg) = serde_json::to_string(&initial_status) {
+        if socket.send(Message::Text(msg)).await.is_err() {
+            return;
+        }
+    }
+
+    let (mut rx_telemetry, mut rx_status) = {
+        let state_guard = state.read().await;
+        (
+            state_guard.tx_telemetry.subscribe(),
+            state_guard.tx_status.subscribe(),
+        )
+    };
+
+    loop {
+        tokio::select! {
+            result = rx_telemetry.recv() => {
+                match result {
+                    Ok(telemetry) => {
+                        if let Ok(msg) = serde_json::to_string(&telemetry) {
+                            if socket.send(Message::Text(msg)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            result = rx_status.changed() => {
+                if result.is_err() { break; }
+                let status = rx_status.borrow().clone();
+                if let Ok(msg) = serde_json::to_string(&status) {
+                    if socket.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        handle_client_msg(text, &state).await;
+                    }
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+}
+
+async fn handle_client_msg(text: String, state: &SharedState) {
+    #[derive(Deserialize)]
+    #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+    enum ClientMsg {
+        SelectLine { index: usize },
+    }
+
+    if let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) {
+        match msg {
+            ClientMsg::SelectLine { index } => {
+                let mut state_guard = state.write().await;
+                state_guard.last_status.active_line_index = Some(index);
+                for (i, status) in state_guard.last_status.line_statuses.iter_mut().enumerate() {
+                    status.is_active = i == index;
+                }
+                let status_clone = state_guard.last_status.clone();
+                let _ = state_guard.tx_status.send(status_clone);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+/// Periodically persist line completion percentages to the GeoPackage.
+///
+/// Uses the connection pool when available. SQLITE_BUSY is treated as
+/// a fatal architectural violation [Doc 42] — logged at error level.
+pub async fn run_persistence_task(state: SharedState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+
+    loop {
+        interval.tick().await;
+
+        let (pool, statuses) = {
+            let state_guard = state.read().await;
+            let pool = state_guard.db_pool.clone();
+            let statuses: Vec<(usize, f64)> = state_guard
+                .last_status
+                .line_statuses
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s.completion_pct))
+                .collect();
+            (pool, statuses)
+        };
+
+        if let Some(pool) = pool {
+            if !statuses.is_empty() {
+                match pool.get().await {
+                    Ok(conn) => {
+                        let result = conn
+                            .interact(move |conn| {
+                                apply_pool_pragmas(conn)?;
+                                let mut stmt = conn.prepare(
+                                    "UPDATE flight_lines SET completion_pct = ?1 \
+                                     WHERE line_index = ?2",
+                                )?;
+                                for (idx, pct) in &statuses {
+                                    stmt.execute(rusqlite::params![pct, *idx as i64])?;
+                                }
+                                Ok::<(), rusqlite::Error>(())
+                            })
+                            .await;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                let msg = e.to_string();
+                                if msg.contains("SQLITE_BUSY") || msg.contains("database is locked")
+                                {
+                                    log::error!("FATAL: SQLITE_BUSY in persistence task: {e}");
+                                } else {
+                                    log::warn!("persistence write failed: {e}");
+                                }
+                            }
+                            Err(e) => log::warn!("persistence interact failed: {e}"),
+                        }
+                    }
+                    Err(e) => log::warn!("persistence pool.get() failed: {e}"),
+                }
+            }
+        } else {
+            // Fallback: direct GeoPackage access (no pool yet)
+            let path = {
+                let state_guard = state.read().await;
+                state_guard.persistence_path.clone()
+            };
+            if let Some(path) = path {
+                if !statuses.is_empty() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(gpkg) = GeoPackage::open(&path) {
+                            let _ = gpkg.update_line_statuses("flight_lines", &statuses);
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Simulate GNSS telemetry by walking through the flight plan waypoints.
+pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut line_idx = 0;
+    let mut waypoint_idx = 0;
+
+    loop {
+        interval.tick().await;
+
+        let plan = {
+            let state_guard = state.read().await;
+            state_guard.flight_plan.clone()
+        };
+
+        if let Some(plan) = plan {
+            if plan.lines.is_empty() {
+                continue;
+            }
+            if line_idx >= plan.lines.len() {
+                line_idx = 0;
+                waypoint_idx = 0;
+            }
+
+            let line = &plan.lines[line_idx];
+            if waypoint_idx >= line.len() {
+                line_idx += 1;
+                waypoint_idx = 0;
+                continue;
+            }
+
+            let lat = line.lats()[waypoint_idx].to_degrees();
+            let lon = line.lons()[waypoint_idx].to_degrees();
+            let alt = line.elevations()[waypoint_idx];
+
+            let telemetry = CurrentState {
+                lat,
+                lon,
+                alt,
+                alt_datum: line.altitude_datum,
+                ground_speed_ms: speed_ms,
+                true_heading_deg: 0.0,
+                fix_quality: 4,
+            };
+
+            {
+                let mut state_guard = state.write().await;
+                state_guard.last_telemetry = telemetry.clone();
+                let _ = state_guard.tx_telemetry.send(telemetry);
+            }
+
+            waypoint_idx += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan generation (synchronous, rayon-safe)
+// ---------------------------------------------------------------------------
+
 fn calculate_total_distance(plan: &FlightPlan) -> f64 {
-    let mut total_m = 0.0;
+    let mut acc = crate::math::numerics::KahanAccumulator::new();
     let geod = geographiclib_rs::Geodesic::wgs84();
     for line in &plan.lines {
         for i in 1..line.len() {
@@ -411,10 +1214,10 @@ fn calculate_total_distance(plan: &FlightPlan) -> f64 {
             let (lat2, lon2) = (line.lats()[i].to_degrees(), line.lons()[i].to_degrees());
             let (dist, _, _) =
                 geographiclib_rs::InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
-            total_m += dist;
+            acc.add(dist);
         }
     }
-    total_m / 1000.0
+    acc.total() / 1000.0
 }
 
 fn generate_plan_internal(
@@ -700,335 +1503,44 @@ fn generate_corridor_plan_internal(
     Ok(plan)
 }
 
-async fn get_plan(State(state): State<SharedState>) -> impl IntoResponse {
-    let state_guard = state.read().await;
-    if let Some(ref plan) = state_guard.flight_plan {
-        let geojson = crate::io::geojson::flight_plan_to_geojson(plan, None, None, None);
-        Json(geojson).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "No mission loaded").into_response()
-    }
-}
-
-async fn export_qgc(State(state): State<SharedState>) -> impl IntoResponse {
-    let terrain_engine = state.read().await.terrain_engine.clone();
-    let plan = state.read().await.flight_plan.as_ref().cloned();
-
-    let plan = match plan {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, "No mission loaded").into_response(),
-    };
-
-    let result = tokio::task::spawn_blocking(move || {
-        let qgc_datum = plan
-            .lines
-            .first()
-            .map(|l| l.altitude_datum)
-            .unwrap_or(AltitudeDatum::Egm2008);
-        let needs_conversion =
-            qgc_datum != AltitudeDatum::Agl && qgc_datum != AltitudeDatum::Wgs84Ellipsoidal;
-
-        let mut qgc_plan = plan;
-        if needs_conversion {
-            let mut converted = Vec::with_capacity(qgc_plan.lines.len());
-            for line in qgc_plan.lines {
-                converted.push(line.to_datum(AltitudeDatum::Wgs84Ellipsoidal, &terrain_engine)?);
-            }
-            qgc_plan.lines = converted;
-        }
-
-        let trigger_dist = qgc_plan.params.photo_interval();
-        let json = crate::io::qgc::flight_plan_to_qgc(&qgc_plan, trigger_dist);
-        Ok::<serde_json::Value, anyhow::Error>(json)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(json)) => Json(json).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Export failed: {e}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal Error: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-async fn export_dji(State(state): State<SharedState>) -> impl IntoResponse {
-    let terrain_engine = state.read().await.terrain_engine.clone();
-    let plan = state.read().await.flight_plan.as_ref().cloned();
-
-    let plan = match plan {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND, "No mission loaded").into_response(),
-    };
-
-    let result = tokio::task::spawn_blocking(move || {
-        let dji_datum = plan
-            .lines
-            .first()
-            .map(|l| l.altitude_datum)
-            .unwrap_or(AltitudeDatum::Egm2008);
-
-        let mut dji_plan = plan;
-        if dji_datum != AltitudeDatum::Egm96 {
-            let mut converted = Vec::with_capacity(dji_plan.lines.len());
-            for line in dji_plan.lines {
-                converted.push(line.to_datum(AltitudeDatum::Egm96, &terrain_engine)?);
-            }
-            dji_plan.lines = converted;
-        }
-
-        let bytes = crate::io::dji::build_dji_kmz(&dji_plan)?;
-        Ok::<Vec<u8>, anyhow::Error>(bytes)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(bytes)) => (
-            [
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    "application/vnd.google-earth.kmz",
-                ),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"mission.kmz\"",
-                ),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Export failed: {e}"),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Internal Error: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct WsParams {
-    pub token: Option<String>,
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Query(params): Query<WsParams>,
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
-    if let Some(_token) = params.token {
-        ws.on_upgrade(|socket| handle_socket(socket, state))
-    } else {
-        (StatusCode::UNAUTHORIZED, "Missing token").into_response()
-    }
-}
-
-async fn handle_socket(mut socket: WebSocket, state: SharedState) {
-    let initial_status = {
-        let state_guard = state.read().await;
-        let status = state_guard.tx_status.borrow().clone();
-        status
-    };
-
-    if let Ok(msg) = serde_json::to_string(&initial_status) {
-        if socket.send(Message::Text(msg)).await.is_err() {
-            return;
-        }
-    }
-
-    let (mut rx_telemetry, mut rx_status) = {
-        let state_guard = state.read().await;
-        (
-            state_guard.tx_telemetry.subscribe(),
-            state_guard.tx_status.subscribe(),
-        )
-    };
-
-    loop {
-        tokio::select! {
-            result = rx_telemetry.recv() => {
-                match result {
-                    Ok(telemetry) => {
-                        if let Ok(msg) = serde_json::to_string(&telemetry) {
-                            if socket.send(Message::Text(msg)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
-                }
-            }
-            result = rx_status.changed() => {
-                if result.is_err() { break; }
-                let status = rx_status.borrow().clone();
-                if let Ok(msg) = serde_json::to_string(&status) {
-                    if socket.send(Message::Text(msg)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        handle_client_msg(text, &state).await;
-                    }
-                    Some(Ok(_)) => continue,
-                    _ => break,
-                }
-            }
-        }
-    }
-}
-
-async fn handle_client_msg(text: String, state: &SharedState) {
-    #[derive(Deserialize)]
-    #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
-    enum ClientMsg {
-        SelectLine { index: usize },
-    }
-
-    if let Ok(msg) = serde_json::from_str::<ClientMsg>(&text) {
-        match msg {
-            ClientMsg::SelectLine { index } => {
-                let mut state_guard = state.write().await;
-                state_guard.last_status.active_line_index = Some(index);
-                for (i, status) in state_guard.last_status.line_statuses.iter_mut().enumerate() {
-                    status.is_active = i == index;
-                }
-                let status_clone = state_guard.last_status.clone();
-                let _ = state_guard.tx_status.send(status_clone);
-            }
-        }
-    }
-}
-
-pub async fn run_persistence_task(state: SharedState) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-
-    loop {
-        interval.tick().await;
-
-        let (path, statuses) = {
-            let state_guard = state.read().await;
-            let path = state_guard.persistence_path.clone();
-            let statuses: Vec<(usize, f64)> = state_guard
-                .last_status
-                .line_statuses
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (i, s.completion_pct))
-                .collect();
-            (path, statuses)
-        };
-
-        if let Some(path) = path {
-            if !statuses.is_empty() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(gpkg) = GeoPackage::open(&path) {
-                        let _ = gpkg.update_line_statuses("flight_lines", &statuses);
-                    }
-                })
-                .await;
-            }
-        }
-    }
-}
-
-pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    let mut line_idx = 0;
-    let mut waypoint_idx = 0;
-
-    loop {
-        interval.tick().await;
-
-        let plan = {
-            let state_guard = state.read().await;
-            state_guard.flight_plan.clone()
-        };
-
-        if let Some(plan) = plan {
-            if plan.lines.is_empty() {
-                continue;
-            }
-            if line_idx >= plan.lines.len() {
-                line_idx = 0;
-                waypoint_idx = 0;
-            }
-
-            let line = &plan.lines[line_idx];
-            if waypoint_idx >= line.len() {
-                line_idx += 1;
-                waypoint_idx = 0;
-                continue;
-            }
-
-            let lat = line.lats()[waypoint_idx].to_degrees();
-            let lon = line.lons()[waypoint_idx].to_degrees();
-            let alt = line.elevations()[waypoint_idx];
-
-            let telemetry = CurrentState {
-                lat,
-                lon,
-                alt,
-                alt_datum: line.altitude_datum,
-                ground_speed_ms: speed_ms,
-                true_heading_deg: 0.0,
-                fix_quality: 4,
-            };
-
-            {
-                let mut state_guard = state.write().await;
-                state_guard.last_telemetry = telemetry.clone();
-                let _ = state_guard.tx_telemetry.send(telemetry);
-            }
-
-            waypoint_idx += 1;
-        }
-    }
-}
-
-async fn update_line(
-    State(state): State<SharedState>,
-    axum::extract::Path(index): axum::extract::Path<usize>,
-    Json(status): Json<LineStatus>,
-) -> impl IntoResponse {
-    let mut state_guard = state.write().await;
-    if let Some(ref mut _plan) = state_guard.flight_plan {
-        if index < state_guard.last_status.line_statuses.len() {
-            state_guard.last_status.line_statuses[index] = status;
-            let status_clone = state_guard.last_status.clone();
-            let _ = state_guard.tx_status.send(status_clone);
-            StatusCode::OK.into_response()
-        } else {
-            (StatusCode::NOT_FOUND, "Line index out of bounds").into_response()
-        }
-    } else {
-        (StatusCode::NOT_FOUND, "No mission loaded").into_response()
-    }
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request;
     use tower::util::ServiceExt;
 
-    #[tokio::test]
-    async fn fms_state_roundtrip() {
+    fn test_app_state() -> (AppState, String) {
+        let token = "test_token_abc123".to_string();
         let state = Arc::new(RwLock::new(FmsState::new().unwrap()));
-        let req = LoadMissionRequest {
+        let app = AppState {
+            fms: state,
+            token: Arc::new(token.clone()),
+        };
+        (app, token)
+    }
+
+    fn test_router(app: AppState) -> Router {
+        let rest = Router::new()
+            .route("/api/v1/missions", post(create_mission))
+            .route("/api/v1/missions/:id", get(get_mission))
+            .route("/api/v1/missions/:id/lines", get(get_lines))
+            .route(
+                "/api/v1/missions/:id/lines/:line_id",
+                put(update_line).delete(delete_line),
+            )
+            .route_layer(middleware::from_fn_with_state(app.clone(), auth_middleware));
+
+        Router::new()
+            .merge(rest)
+            .route("/ws", get(ws_handler))
+            .with_state(app)
+    }
+
+    fn sample_mission_request() -> LoadMissionRequest {
+        LoadMissionRequest {
             min_lat: Some(51.0),
             min_lon: Some(0.0),
             max_lat: Some(51.1),
@@ -1061,34 +1573,45 @@ mod tests {
             launch_lon: None,
             terrain: false,
             datum: "egm2008".into(),
-        };
+        }
+    }
 
-        let app = Router::new()
-            .route("/api/v1/mission/load", post(load_mission))
-            .route("/api/v1/mission/plan", get(get_plan))
-            .with_state(state.clone());
+    #[tokio::test]
+    async fn mission_create_and_get_lines() {
+        let (app, token) = test_app_state();
+        let router = test_router(app);
 
-        let response = app
+        let response = router
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/mission/load")
+                    .uri("/api/v1/missions")
                     .header("Content-Type", "application/json")
-                    .body(axum::body::Body::from(serde_json::to_vec(&req).unwrap()))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&sample_mission_request()).unwrap(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let summary: MissionSummaryResponse = serde_json::from_slice(&body).unwrap();
+        assert!(summary.line_count > 0);
+        let id = summary.id;
 
-        let response = app
+        let response = router
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/v1/mission/plan")
-                    .body(axum::body::Body::empty())
+                    .uri(format!("/api/v1/missions/{id}/lines"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
@@ -1100,7 +1623,227 @@ mod tests {
             .unwrap();
         let fc: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fc["type"], "FeatureCollection");
-        assert!(fc["features"].as_array().unwrap().len() > 0);
+        assert!(!fc["features"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_missing_token() {
+        let (app, _token) = test_app_state();
+        let router = test_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/missions/1/lines")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["code"], "ERR_UNAUTHORIZED");
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_wrong_token() {
+        let (app, _token) = test_app_state();
+        let router = test_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/missions/1/lines")
+                    .header("Authorization", "Bearer wrong_token_value")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["code"], "ERR_UNAUTHORIZED");
+    }
+
+    #[tokio::test]
+    async fn structured_error_on_invalid_input() {
+        let (app, token) = test_app_state();
+        let router = test_router(app);
+
+        // POST with no bbox and no boundary — should fail with structured error
+        let mut req = sample_mission_request();
+        req.min_lat = None;
+        req.min_lon = None;
+        req.max_lat = None;
+        req.max_lon = None;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/missions")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(serde_json::to_vec(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["code"].as_str().unwrap().starts_with("ERR_"));
+        assert!(!err["message"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mission_not_found_404() {
+        let (app, token) = test_app_state();
+        let router = test_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/missions/999")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err["code"], "ERR_MISSION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn delete_line_recalculates() {
+        let (app, token) = test_app_state();
+        let router = test_router(app.clone());
+
+        // Create mission
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/missions")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&sample_mission_request()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let summary: MissionSummaryResponse = serde_json::from_slice(&body).unwrap();
+        let original_count = summary.line_count;
+        let id = summary.id;
+        assert!(
+            original_count >= 2,
+            "need at least 2 lines to test deletion"
+        );
+
+        // Delete line 0
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/missions/{id}/lines/0"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let updated: MissionSummaryResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated.line_count, original_count - 1);
+    }
+
+    #[tokio::test]
+    async fn delete_line_adjusts_active() {
+        let (app, token) = test_app_state();
+        let router = test_router(app.clone());
+
+        // Create mission
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/missions")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&sample_mission_request()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10 * 1024 * 1024)
+            .await
+            .unwrap();
+        let summary: MissionSummaryResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            summary.line_count >= 3,
+            "need at least 3 lines to test active adjustment"
+        );
+
+        // Set active_line to 2
+        {
+            let mut state = app.fms.write().await;
+            state.last_status.active_line_index = Some(2);
+            for (i, ls) in state.last_status.line_statuses.iter_mut().enumerate() {
+                ls.is_active = i == 2;
+            }
+        }
+
+        // Delete line 1 — active should shift from 2 to 1
+        let id = summary.id;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/missions/{id}/lines/1"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let state = app.fms.read().await;
+        assert_eq!(state.last_status.active_line_index, Some(1));
     }
 
     /// mDNS IP discovery must return a non-loopback address (or the 0.0.0.0 fallback).

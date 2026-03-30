@@ -1,6 +1,6 @@
 [package]
 name = "irontrack"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Open-source flight management and aerial survey planning engine"
@@ -40,6 +40,10 @@ tokio-serial = { version = "5", optional = true }
 mdns-sd = "0.13"
 local-ip-address = "0.6"
 nalgebra = "0.33"
+deadpool-sqlite = { version = "0.8", features = ["rt_tokio_1"] }
+subtle = "2"
+rand = "0.8"
+tokio-util = { version = "0.7", features = ["io"] }
 
 [patch.crates-io]
 egm96 = { path = "vendor/egm96" }

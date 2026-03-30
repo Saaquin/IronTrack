@@ -283,6 +283,12 @@ enum Commands {
         /// USB Product ID for GNSS receiver.
         #[arg(long, default_value = "425")] // 0x01A9
         gnss_pid: u16,
+
+        /// Additional CORS allowed origins (repeatable).
+        /// Default always includes localhost. Use for LAN access:
+        ///   --cors-origin http://192.168.1.100:5173
+        #[arg(long = "cors-origin", value_name = "URL")]
+        cors_origins: Vec<String>,
     },
 
     /// Ask a question about IronTrack, aerial survey, or photogrammetry.
@@ -410,7 +416,15 @@ fn main() {
             mock_speed,
             gnss_vid,
             gnss_pid,
-        }) => run_daemon(port, mock_telemetry, mock_speed, gnss_vid, gnss_pid),
+            cors_origins,
+        }) => run_daemon(
+            port,
+            mock_telemetry,
+            mock_speed,
+            gnss_vid,
+            gnss_pid,
+            cors_origins,
+        ),
         Some(Commands::Ask { question }) => run_ask(question.join(" ")),
         Some(Commands::NlPlan {
             description,
@@ -439,13 +453,14 @@ async fn run_daemon(
     mock_speed: f64,
     gnss_vid: u16,
     gnss_pid: u16,
+    cors_origins: Vec<String>,
 ) -> Result<()> {
     let mock = if mock_telemetry {
         Some(mock_speed)
     } else {
         None
     };
-    irontrack::network::server::run_server(port, mock, gnss_vid, gnss_pid).await?;
+    irontrack::network::server::run_server(port, mock, gnss_vid, gnss_pid, cors_origins).await?;
     Ok(())
 }
 
