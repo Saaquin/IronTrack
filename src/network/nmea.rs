@@ -18,13 +18,48 @@
 use crate::network::telemetry::CurrentState;
 use crate::types::AltitudeDatum;
 
-/// Parser for NMEA 0183 sentences.
-pub struct NmeaParser;
+/// Intermediate GGA data held until a matching RMC completes the epoch.
+struct GgaEpoch {
+    utc_time: String,
+    lat: f64,
+    lon: f64,
+    alt: f64,
+    alt_datum: AltitudeDatum,
+    fix_quality: u8,
+    satellites_in_use: u8,
+    hdop: f64,
+    geoid_separation_m: f64,
+}
+
+/// Stateful parser for NMEA 0183 sentences.
+///
+/// Implements epoch consistency per Doc 23 §4.2: GGA is buffered until
+/// a matching RMC (same UTC timestamp) arrives, then both are merged
+/// into a single `CurrentState` update.  GGK sentences (Trimble
+/// proprietary) are self-contained and bypass epoch pairing.
+pub struct NmeaParser {
+    pending_gga: Option<GgaEpoch>,
+}
+
+impl Default for NmeaParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl NmeaParser {
-    /// Validate checksum and parse a single NMEA sentence.
-    /// Updates the provided `CurrentState` with any fields found.
-    pub fn parse(sentence: &str, state: &mut CurrentState) -> bool {
+    pub fn new() -> Self {
+        Self { pending_gga: None }
+    }
+
+    /// Feed a single NMEA sentence.
+    ///
+    /// Returns `true` when `state` was updated with new data:
+    /// - GGA: always `false` (buffered, awaiting matching RMC).
+    /// - RMC: `true` — merges pending GGA if UTC matches, otherwise
+    ///   applies kinematics only (speed, heading, date, time).
+    /// - GGK: `true` — self-contained, updates position directly.
+    pub fn parse(&mut self, sentence: &str, state: &mut CurrentState) -> bool {
         if !validate_checksum(sentence) {
             return false;
         }
@@ -39,15 +74,56 @@ impl NmeaParser {
             return false;
         }
 
-        let _talker_id = &fields[0][0..2];
+        // PTNL,GGK has a non-standard structure: fields[0]="PTNL", fields[1]="GGK"
+        if fields[0] == "PTNL" && fields.len() > 1 && fields[1] == "GGK" {
+            self.pending_gga = None;
+            return parse_ggk(&fields, state);
+        }
+
+        // Standard NMEA: fields[0] = <2-char talker><3-char formatter>
+        if fields[0].len() < 5 {
+            return false;
+        }
         let formatter = &fields[0][2..];
 
         match formatter {
-            "GGA" => parse_gga(&fields, state),
-            "RMC" => parse_rmc(&fields, state),
-            "GGK" if fields[0] == "PTNL" => parse_ggk(&fields, state),
+            "GGA" => {
+                self.pending_gga = extract_gga_epoch(&fields);
+                false
+            }
+            "RMC" => self.try_complete_epoch(&fields, state),
             _ => false,
         }
+    }
+
+    /// Attempt to complete an epoch by merging pending GGA with this RMC.
+    fn try_complete_epoch(&mut self, fields: &[&str], state: &mut CurrentState) -> bool {
+        if !apply_rmc_kinematics(fields, state) {
+            return false;
+        }
+
+        let rmc_utc = if fields.len() > 1 && !fields[1].is_empty() {
+            fields[1]
+        } else {
+            ""
+        };
+
+        // If pending GGA matches on UTC, merge position data into state.
+        if let Some(gga) = self.pending_gga.take() {
+            if !rmc_utc.is_empty() && gga.utc_time == rmc_utc {
+                state.lat = gga.lat;
+                state.lon = gga.lon;
+                state.alt = gga.alt;
+                state.alt_datum = gga.alt_datum;
+                state.fix_quality = gga.fix_quality;
+                state.satellites_in_use = gga.satellites_in_use;
+                state.hdop = gga.hdop;
+                state.geoid_separation_m = gga.geoid_separation_m;
+            }
+            // Stale GGA (UTC mismatch) is silently consumed.
+        }
+
+        true
     }
 }
 
@@ -78,37 +154,44 @@ fn validate_checksum(sentence: &str) -> bool {
     }
 }
 
-fn parse_gga(fields: &[&str], state: &mut CurrentState) -> bool {
+/// Extract GGA fields into an intermediate epoch buffer.
+fn extract_gga_epoch(fields: &[&str]) -> Option<GgaEpoch> {
     if fields.len() < 12 {
-        return false;
+        return None;
     }
 
-    // Latitude: Field 2 (ddmm.mmmm), Field 3 (N/S)
-    if let Some(lat) = parse_nmea_coordinate(fields[2], fields[3], 2) {
-        state.lat = lat;
-    }
+    let utc_time = if !fields[1].is_empty() {
+        fields[1].to_string()
+    } else {
+        return None; // Cannot pair without UTC
+    };
 
-    // Longitude: Field 4 (dddmm.mmmm), Field 5 (E/W)
-    if let Some(lon) = parse_nmea_coordinate(fields[4], fields[5], 3) {
-        state.lon = lon;
-    }
+    // Reject the entire epoch if critical positional fields are missing.
+    // Non-critical fields (HDOP, satellites) fall back to safe defaults.
+    let lat = parse_nmea_coordinate(fields[2], fields[3], 2)?;
+    let lon = parse_nmea_coordinate(fields[4], fields[5], 3)?;
+    let fix_quality = fields[6].parse::<u8>().ok()?;
+    let satellites_in_use = fields[7].parse::<u8>().unwrap_or(0);
+    let hdop = fields[8].parse::<f64>().unwrap_or(99.9);
+    let alt = fields[9].parse::<f64>().unwrap_or(0.0);
+    let geoid_separation_m = fields[11].parse::<f64>().unwrap_or(0.0);
 
-    // Fix Quality: Field 6
-    if let Ok(quality) = fields[6].parse::<u8>() {
-        state.fix_quality = quality;
-    }
-
-    // Orthometric height (MSL): Field 9
-    if let Ok(msl) = fields[9].parse::<f64>() {
-        // We track altitude in MSL (EGM96 for most NMEA)
-        state.alt = msl;
-        state.alt_datum = AltitudeDatum::Egm96;
-    }
-
-    true
+    Some(GgaEpoch {
+        utc_time,
+        lat,
+        lon,
+        alt,
+        alt_datum: AltitudeDatum::Egm96,
+        fix_quality,
+        satellites_in_use,
+        hdop,
+        geoid_separation_m,
+    })
 }
 
-fn parse_rmc(fields: &[&str], state: &mut CurrentState) -> bool {
+/// Apply RMC kinematic fields (speed, heading, time, date) to state.
+/// Returns `false` if the sentence is malformed or status is invalid.
+fn apply_rmc_kinematics(fields: &[&str], state: &mut CurrentState) -> bool {
     if fields.len() < 9 {
         return false;
     }
@@ -116,6 +199,11 @@ fn parse_rmc(fields: &[&str], state: &mut CurrentState) -> bool {
     // Status: Field 2 (A=Valid, V=Warning)
     if fields[2] != "A" {
         return false;
+    }
+
+    // UTC time: Field 1 (hhmmss.ss)
+    if !fields[1].is_empty() {
+        state.utc_time = fields[1].to_string();
     }
 
     // Ground Speed (knots): Field 7
@@ -126,6 +214,11 @@ fn parse_rmc(fields: &[&str], state: &mut CurrentState) -> bool {
     // Course Over Ground (degrees true): Field 8
     if let Ok(cog) = fields[8].parse::<f64>() {
         state.true_heading_deg = cog;
+    }
+
+    // UTC date: Field 9 (ddmmyy)
+    if fields.len() > 9 && !fields[9].is_empty() {
+        state.utc_date = fields[9].to_string();
     }
 
     true
@@ -316,28 +409,156 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn parse_gga_standard() {
+    fn parse_gga_buffers_without_updating_state() {
+        let mut parser = NmeaParser::new();
         let mut state = CurrentState::default();
-        let sentence =
-            "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
-        assert!(NmeaParser::parse(sentence, &mut state));
+        let gga = "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
+        // GGA alone buffers — does NOT update state
+        assert!(!parser.parse(gga, &mut state));
+        assert_eq!(state.lat, 0.0);
+    }
+
+    #[test]
+    fn parse_gga_rmc_epoch_match() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        let gga = "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
+        let rmc = "$GNRMC,123519.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*38";
+        assert!(!parser.parse(gga, &mut state));
+        assert!(parser.parse(rmc, &mut state));
+        // GGA position merged
         assert_eq!(state.fix_quality, 4);
         assert!((state.lat - 48.1173016).abs() < 1e-7);
         assert!((state.lon - 11.5166683).abs() < 1e-7);
         assert_eq!(state.alt, 545.4);
         assert_eq!(state.alt_datum, AltitudeDatum::Egm96);
+        // RMC kinematics merged
+        assert!((state.ground_speed_ms - 125.5 * 0.514444).abs() < 1e-5);
+        assert_eq!(state.true_heading_deg, 76.2);
     }
 
     // ------------------------------------------------------------------
-    // Full RMC sentence parsing
+    // Full RMC sentence parsing (kinematic-only, no preceding GGA)
     // ------------------------------------------------------------------
 
     #[test]
-    fn parse_rmc_standard() {
+    fn parse_rmc_kinematic_only() {
+        let mut parser = NmeaParser::new();
         let mut state = CurrentState::default();
-        let sentence =
-            "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
-        assert!(NmeaParser::parse(sentence, &mut state));
+        let rmc = "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
+        assert!(parser.parse(rmc, &mut state));
+        assert!((state.ground_speed_ms - 125.5 * 0.514444).abs() < 1e-5);
+        assert_eq!(state.true_heading_deg, 76.2);
+        // Position remains at default (no GGA to merge)
+        assert_eq!(state.lat, 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // Epoch consistency
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn epoch_mismatch_discards_stale_gga() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        // GGA at UTC 100000.00
+        let gga = "$GNGGA,100000.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*5F";
+        // RMC at UTC 100001.00 (mismatched)
+        let rmc = "$GNRMC,100001.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*35";
+        assert!(!parser.parse(gga, &mut state));
+        assert!(parser.parse(rmc, &mut state));
+        // Lat/lon remain at default — stale GGA discarded
+        assert_eq!(state.lat, 0.0);
+        assert_eq!(state.lon, 0.0);
+        // RMC kinematics applied
+        assert!((state.ground_speed_ms - 125.5 * 0.514444).abs() < 1e-5);
+        assert_eq!(state.utc_date, "130495");
+    }
+
+    #[test]
+    fn parse_rmc_extracts_date() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        let rmc = "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
+        assert!(parser.parse(rmc, &mut state));
+        assert_eq!(state.utc_date, "130495");
+        assert_eq!(state.utc_time, "210230.00");
+    }
+
+    #[test]
+    fn parse_gga_extracts_hdop_sats_geoid() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        let gga = "$GNGGA,123519.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*53";
+        let rmc = "$GNRMC,123519.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*38";
+        assert!(!parser.parse(gga, &mut state));
+        assert!(parser.parse(rmc, &mut state));
+        assert_eq!(state.satellites_in_use, 12);
+        assert!((state.hdop - 0.9).abs() < 1e-6);
+        assert!((state.geoid_separation_m - 46.9).abs() < 1e-6);
+        assert_eq!(state.utc_time, "123519.00");
+    }
+
+    // ------------------------------------------------------------------
+    // GGK (Trimble proprietary)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_ggk_trimble_fixed() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        let ggk =
+            "$PTNL,GGK,102939.00,051910,5000.97323841,N,00827.62010742,E,3,09,1.9,EHT150.790,M*75";
+        assert!(parser.parse(ggk, &mut state));
+        assert_eq!(state.fix_quality, 4); // Trimble 3 → standard 4
+        assert_eq!(state.alt_datum, AltitudeDatum::Wgs84Ellipsoidal);
+        assert!((state.alt - 150.790).abs() < 1e-3);
+        // 8-decimal precision: 5000.97323841 → 50 + 0.97323841/60 ≈ 50.01622064
+        assert!((state.lat - 50.01622064).abs() < 1e-7);
+    }
+
+    #[test]
+    fn parse_ggk_does_not_require_rmc_pairing() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        let ggk =
+            "$PTNL,GGK,102939.00,051910,5000.97323841,N,00827.62010742,E,3,09,1.9,EHT150.790,M*75";
+        // Single GGK returns true and updates position directly
+        assert!(parser.parse(ggk, &mut state));
+        assert!(state.lat != 0.0);
+        assert!(state.lon != 0.0);
+    }
+
+    #[test]
+    fn ggk_clears_pending_gga() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        // Buffer a GGA first
+        let gga = "$GNGGA,102939.00,4807.0381,N,01131.0001,E,4,12,0.9,545.4,M,46.9,M,1.5,0000*5E";
+        assert!(!parser.parse(gga, &mut state));
+        // GGK clears the pending GGA
+        let ggk =
+            "$PTNL,GGK,102939.00,051910,5000.97323841,N,00827.62010742,E,3,09,1.9,EHT150.790,M*75";
+        assert!(parser.parse(ggk, &mut state));
+        // Now RMC with matching UTC should NOT merge stale GGA position
+        let rmc = "$GNRMC,102939.00,A,5000.9732,N,00827.6201,E,55.0,180.5,290326,003.1,E,R*08";
+        assert!(parser.parse(rmc, &mut state));
+        // Position should remain from GGK (lat ≈ 50.016), not GGA (lat ≈ 48.117)
+        assert!((state.lat - 50.01622064).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rmc_without_gga_updates_kinematics_only() {
+        let mut parser = NmeaParser::new();
+        let mut state = CurrentState::default();
+        state.lat = 51.0; // Pre-set position
+        state.lon = -1.0;
+        let rmc = "$GNRMC,210230.00,A,3855.4487,N,09446.0071,W,125.5,076.2,130495,003.8,E,A*37";
+        assert!(parser.parse(rmc, &mut state));
+        // Position unchanged (no GGA to merge)
+        assert_eq!(state.lat, 51.0);
+        assert_eq!(state.lon, -1.0);
+        // Kinematics updated
         assert!((state.ground_speed_ms - 125.5 * 0.514444).abs() < 1e-5);
         assert_eq!(state.true_heading_deg, 76.2);
     }

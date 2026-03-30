@@ -27,6 +27,11 @@ pub struct CurrentState {
     pub ground_speed_ms: f64,
     pub true_heading_deg: f64,
     pub fix_quality: u8, // 0=None, 1=Autonomous, 2=DGPS, 4=RTK Fixed, 5=RTK Float
+    pub hdop: f64,
+    pub satellites_in_use: u8,
+    pub geoid_separation_m: f64,
+    pub utc_time: String, // "hhmmss.ss" from GGA/RMC field 1
+    pub utc_date: String, // "ddmmyy" from RMC field 9
 }
 
 impl Default for CurrentState {
@@ -39,6 +44,11 @@ impl Default for CurrentState {
             ground_speed_ms: 0.0,
             true_heading_deg: 0.0,
             fix_quality: 0,
+            hdop: 99.9,
+            satellites_in_use: 0,
+            geoid_separation_m: 0.0,
+            utc_time: String::new(),
+            utc_date: String::new(),
         }
     }
 }
@@ -90,4 +100,10 @@ pub enum ServerMsg {
     Status(SystemStatus),
     /// Sensor trigger event (camera/LiDAR firing confirmation).
     Trigger(TriggerEvent),
+    /// Operational warning broadcast (RTK degradation, DOP spike, etc.).
+    Warning {
+        code: String,
+        message: String,
+        timestamp_ms: u64,
+    },
 }

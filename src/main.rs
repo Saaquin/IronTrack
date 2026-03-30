@@ -284,6 +284,10 @@ enum Commands {
         #[arg(long, default_value = "425")] // 0x01A9
         gnss_pid: u16,
 
+        /// Serial baud rate for GNSS receiver.
+        #[arg(long, default_value = "115200")]
+        gnss_baud: u32,
+
         /// Additional CORS allowed origins (repeatable).
         /// Default always includes localhost. Use for LAN access:
         ///   --cors-origin http://192.168.1.100:5173
@@ -416,6 +420,7 @@ fn main() {
             mock_speed,
             gnss_vid,
             gnss_pid,
+            gnss_baud,
             cors_origins,
         }) => run_daemon(
             port,
@@ -423,6 +428,7 @@ fn main() {
             mock_speed,
             gnss_vid,
             gnss_pid,
+            gnss_baud,
             cors_origins,
         ),
         Some(Commands::Ask { question }) => run_ask(question.join(" ")),
@@ -453,6 +459,7 @@ async fn run_daemon(
     mock_speed: f64,
     gnss_vid: u16,
     gnss_pid: u16,
+    gnss_baud: u32,
     cors_origins: Vec<String>,
 ) -> Result<()> {
     let mock = if mock_telemetry {
@@ -460,7 +467,8 @@ async fn run_daemon(
     } else {
         None
     };
-    irontrack::network::server::run_server(port, mock, gnss_vid, gnss_pid, cors_origins).await?;
+    irontrack::network::server::run_server(port, mock, gnss_vid, gnss_pid, gnss_baud, cors_origins)
+        .await?;
     Ok(())
 }
 

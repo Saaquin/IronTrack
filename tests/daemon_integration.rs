@@ -328,6 +328,7 @@ async fn ws_lagged_receiver() {
                     ground_speed_ms: 15.0,
                     true_heading_deg: 90.0,
                     fix_quality: 4,
+                    ..Default::default()
                 });
         }
         drop(guard);
@@ -346,6 +347,7 @@ async fn ws_lagged_receiver() {
                     ground_speed_ms: 15.0,
                     true_heading_deg: 0.0,
                     fix_quality: 4,
+                    ..Default::default()
                 });
             sleep(Duration::from_millis(50)).await;
         }
@@ -434,7 +436,7 @@ async fn test_daemon_full_flow() {
     // 1. Start daemon in background (port 8081 to avoid conflict)
     let port = 8081;
     tokio::spawn(async move {
-        irontrack::network::server::run_server(port, Some(15.0), 0, 0, vec![])
+        irontrack::network::server::run_server(port, Some(15.0), 0, 0, 115_200, vec![])
             .await
             .unwrap();
     });

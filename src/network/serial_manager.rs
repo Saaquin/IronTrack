@@ -17,33 +17,50 @@
 
 use crate::network::nmea::NmeaParser;
 use crate::network::server::SharedState;
+use crate::network::telemetry::ServerMsg;
 use serialport::{available_ports, SerialPortType, UsbPortInfo};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::sleep;
 use tokio_serial::SerialStream;
 
+/// Consecutive degraded epochs before broadcasting an RTK warning.
+/// At 10 Hz, 20 epochs = 2 seconds of sustained degradation.
+const RTK_DEBOUNCE_EPOCHS: u16 = 20;
+
+/// If no valid NMEA sentence is parsed within this duration, assume
+/// the serial link is dead and trigger hot-plug recovery.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct SerialManager {
     vid: u16,
     pid: u16,
+    baud_rate: u32,
     state: SharedState,
+    start: Instant,
 }
 
 impl SerialManager {
-    pub fn new(vid: u16, pid: u16, state: SharedState) -> Self {
-        Self { vid, pid, state }
+    pub fn new(vid: u16, pid: u16, baud_rate: u32, state: SharedState) -> Self {
+        Self {
+            vid,
+            pid,
+            baud_rate,
+            state,
+            start: Instant::now(),
+        }
     }
 
     pub async fn run(&self) {
         loop {
             if let Some(port_path) = self.find_port() {
-                println!("SerialManager: Found target device at {}", port_path);
+                log::info!("SerialManager: found target device at {}", port_path);
                 if let Err(e) = self.read_loop(&port_path).await {
-                    eprintln!("SerialManager error on {}: {}", port_path, e);
+                    log::warn!("SerialManager error on {}: {}", port_path, e);
                 }
             }
 
-            // Wait before retry (hot-plug backoff)
+            // Hot-plug backoff (Step 2 of 5-step recovery) [Doc 29 §4.3]
             sleep(Duration::from_millis(500)).await;
         }
     }
@@ -61,14 +78,29 @@ impl SerialManager {
     }
 
     async fn read_loop(&self, path: &str) -> anyhow::Result<()> {
-        let builder = tokio_serial::new(path, 115_200); // Base baud, will be higher in production
+        let builder = tokio_serial::new(path, self.baud_rate);
         let stream = SerialStream::open(&builder)?;
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
+        let mut parser = NmeaParser::new();
+        let mut consecutive_degraded: u16 = 0;
 
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).await?;
+
+            // Heartbeat watchdog: if no line received within HEARTBEAT_TIMEOUT,
+            // the serial link is presumed dead. Break out to trigger hot-plug
+            // recovery. Wrapping read_line in tokio::time::timeout handles the
+            // case where the GNSS stops transmitting without closing the port.
+            let read_result = tokio::time::timeout(HEARTBEAT_TIMEOUT, reader.read_line(&mut line))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "heartbeat timeout: no serial data for {}s",
+                        HEARTBEAT_TIMEOUT.as_secs()
+                    )
+                })?;
+            let bytes_read = read_result?;
             if bytes_read == 0 {
                 return Err(anyhow::anyhow!("EOF reached"));
             }
@@ -78,19 +110,40 @@ impl SerialManager {
                 state_guard.last_telemetry.clone()
             };
 
-            if NmeaParser::parse(&line, &mut current_telemetry) {
-                // Check for RTK degradation
+            if parser.parse(&line, &mut current_telemetry) {
+                // RTK degradation detection with debounce [Doc 23 §3.3]
                 let old_quality = {
                     let state_guard = self.state.read().await;
                     state_guard.last_telemetry.fix_quality
                 };
 
-                if old_quality == 4 && current_telemetry.fix_quality < 4 {
-                    eprintln!(
-                        "WARNING: RTK degradation detected! Quality: {} -> {}",
-                        old_quality, current_telemetry.fix_quality
+                if current_telemetry.fix_quality < 4 && old_quality >= 4 {
+                    // Degradation edge detected — start counting
+                    consecutive_degraded = 1;
+                } else if current_telemetry.fix_quality < 4 {
+                    consecutive_degraded = consecutive_degraded.saturating_add(1);
+                } else {
+                    consecutive_degraded = 0;
+                }
+
+                // Broadcast warning only after sustained degradation
+                if consecutive_degraded == RTK_DEBOUNCE_EPOCHS {
+                    log::warn!(
+                        "RTK degradation sustained for {} epochs — quality: {} → {}",
+                        RTK_DEBOUNCE_EPOCHS,
+                        old_quality,
+                        current_telemetry.fix_quality
                     );
-                    // In v0.4+ this would broadcast an event. For now we just update state.
+                    let warning = ServerMsg::Warning {
+                        code: "RTK_DEGRADATION".to_string(),
+                        message: format!(
+                            "RTK fix quality degraded from {} to {} (sustained {} epochs)",
+                            old_quality, current_telemetry.fix_quality, RTK_DEBOUNCE_EPOCHS,
+                        ),
+                        timestamp_ms: self.start.elapsed().as_millis() as u64,
+                    };
+                    let state_guard = self.state.read().await;
+                    let _ = state_guard.tx_warning.send(warning);
                 }
 
                 let mut state_guard = self.state.write().await;

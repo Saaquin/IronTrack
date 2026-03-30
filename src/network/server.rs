@@ -71,6 +71,7 @@ pub struct FmsState {
     pub tx_telemetry: broadcast::Sender<CurrentState>,
     pub tx_status: watch::Sender<SystemStatus>,
     pub tx_trigger: broadcast::Sender<TriggerEvent>,
+    pub tx_warning: broadcast::Sender<ServerMsg>,
 
     // Latest values
     pub last_telemetry: CurrentState,
@@ -91,6 +92,7 @@ impl FmsState {
         let (tx_telemetry, _) = broadcast::channel(256);
         let (tx_status, _) = watch::channel(SystemStatus::default());
         let (tx_trigger, _) = broadcast::channel(256);
+        let (tx_warning, _) = broadcast::channel(64);
 
         Ok(Self {
             flight_plan: None,
@@ -98,6 +100,7 @@ impl FmsState {
             tx_telemetry,
             tx_status,
             tx_trigger,
+            tx_warning,
             last_telemetry: CurrentState::default(),
             last_status: SystemStatus::default(),
             persistence_path: None,
@@ -294,6 +297,7 @@ pub async fn run_server(
     mock_speed: Option<f64>,
     gnss_vid: u16,
     gnss_pid: u16,
+    gnss_baud: u32,
     cors_origins: Vec<String>,
 ) -> anyhow::Result<()> {
     let state = Arc::new(RwLock::new(FmsState::new()?));
@@ -308,14 +312,14 @@ pub async fn run_server(
         // Requires the "serial" feature (libudev-dev on Linux).
         #[cfg(feature = "serial")]
         {
-            let serial_mgr = SerialManager::new(gnss_vid, gnss_pid, state.clone());
+            let serial_mgr = SerialManager::new(gnss_vid, gnss_pid, gnss_baud, state.clone());
             tokio::spawn(async move {
                 serial_mgr.run().await;
             });
         }
         #[cfg(not(feature = "serial"))]
         {
-            let _ = (gnss_vid, gnss_pid);
+            let _ = (gnss_vid, gnss_pid, gnss_baud);
             eprintln!("warning: serial port support disabled (compile with --features serial)");
         }
     }
@@ -1003,12 +1007,13 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
     // 1. Subscribe to ALL channels BEFORE reading the snapshot.
     //    This eliminates the race where a state change between
     //    the snapshot read and the subscription is silently lost.
-    let (mut rx_telemetry, mut rx_status, mut rx_trigger) = {
+    let (mut rx_telemetry, mut rx_status, mut rx_trigger, mut rx_warning) = {
         let guard = state.read().await;
         (
             guard.tx_telemetry.subscribe(),
             guard.tx_status.subscribe(),
             guard.tx_trigger.subscribe(),
+            guard.tx_warning.subscribe(),
         )
     };
 
@@ -1063,6 +1068,19 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                         if let Ok(json) = serde_json::to_string(
                             &ServerMsg::Trigger(event),
                         ) {
+                            if socket.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+            result = rx_warning.recv() => {
+                match result {
+                    Ok(warning) => {
+                        if let Ok(json) = serde_json::to_string(&warning) {
                             if socket.send(Message::Text(json)).await.is_err() {
                                 break;
                             }
@@ -1291,6 +1309,11 @@ pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
                 ground_speed_ms: speed_ms,
                 true_heading_deg: heading,
                 fix_quality: 4,
+                hdop: 0.9,
+                satellites_in_use: 12,
+                geoid_separation_m: 0.0,
+                utc_time: String::new(),
+                utc_date: String::new(),
             };
 
             let trigger = TriggerEvent {
