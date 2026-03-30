@@ -1772,6 +1772,7 @@ pub async fn start_test_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tower::util::ServiceExt;
 
     fn test_app_state() -> (AppState, String) {
@@ -1839,6 +1840,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn mission_create_and_get_lines() {
         let (app, token) = test_app_state();
         let router = test_router(app);
@@ -1997,6 +1999,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn delete_line_recalculates() {
         let (app, token) = test_app_state();
         let router = test_router(app.clone());
@@ -2050,6 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn delete_line_adjusts_active() {
         let (app, token) = test_app_state();
         let router = test_router(app.clone());
