@@ -36,5 +36,5 @@ pub mod pursuit;
 pub mod validation;
 
 pub use bspline_smooth::BSplinePath;
-pub use elastic_band::{ElasticBandSolver, SpringConstants};
+pub use elastic_band::{ElasticBandSolver, FloorMode, SpringConstants};
 pub use pursuit::PursuitController;

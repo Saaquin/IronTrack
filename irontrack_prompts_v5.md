@@ -1,11 +1,33 @@
-# IronTrack — Post-v0.2 Prompt Playbook (v3.5 Revision)
+# IronTrack — Post-v0.3.1 Prompt Playbook (v5 Revision)
+
+> **Documentation Query — MCP Servers**
+>
+> Two MCP servers are configured in `.mcp.json` for querying the 52 research
+> documents in `docs/`. Use them **before** reading full doc files — they save
+> context tokens and return only the relevant sections.
+>
+> | Server | Best for | Key tools |
+> |--------|----------|-----------|
+> | **jdocmunch** | Heading-based navigation, specific section retrieval | `search_sections`, `get_section`, `get_toc` |
+> | **local-rag** | Semantic / meaning-based queries, fuzzy concept search | `query_documents`, `list_files`, `status` |
+>
+> **Workflow for every phase prompt below:**
+> 1. Before reading any `docs/*.md` file directly, query the MCP servers first.
+> 2. Use `search_sections` (jdocmunch) when the prompt names a specific section (e.g., "§3 Elastic Band").
+> 3. Use `query_documents` (local-rag) when exploring a concept across multiple docs.
+> 4. Only `Read` the full file if the MCP results are insufficient or you need surrounding context.
+>
+> **One-time setup (if not already done):**
+> - jdocmunch: call `index_local` with `path` set to the project `docs/` directory.
+> - local-rag: run `npx mcp-local-rag ingest ./docs/` (7,016 chunks indexed).
 
 > **Release strategy (aligned to Manifest v3.5, informed by 52 research documents):**
 >
 > | Release | Theme | Phases | Key Source Docs |
 > |---------|-------|--------|-----------------|
 > | ~~**v0.2**~~ | ~~Correctness, Safety, Autopilot~~ | ~~4A–4J~~ **COMPLETE** | 05, 07, 09, 11-13 |
-> | **v0.3** | Terrain-Following Trajectory Generation | 5A – 5D | 34, 39, 50 |
+> | ~~**v0.3**~~ | ~~Terrain-Following Trajectory Generation~~ | ~~5A–5D~~ **COMPLETE** | 34, 39, 50 |
+> | **v0.3.2** | Audit Remediation (bug fixes + test gaps) | A1 – A5 | Audit report |
 > | **v0.4** | Networked FMS Daemon | 6A – 6D | 28, 29, 42 |
 > | **v0.5** | Atmospheric Kinematics and Energy | 7A – 7B, 8A – 8B | 16, 38, 50 |
 > | **v0.6** | Glass Cockpit MVP | 9A – 9D | 25, 26 |
@@ -15,9 +37,8 @@
 > | **v1.0** | Production Release | 13A – 13E | 36, 44, 46, 51 |
 >
 > Each release is independently shippable and testable.
-> Prerequisites: v0.2 complete. Datum-tagged altitudes, EGM96, DSM warnings,
-> Copernicus attribution, QGC/DJI exports, LiDAR lines, KML import,
-> schema versioning, corridors, Dubins paths, TSP routing all implemented.
+> Prerequisites: v0.3.1 complete. Terrain-following trajectory generation (Elastic Band,
+> B-spline C² smoothing, pure pursuit controller, synthetic validation suite) all implemented.
 >
 > **Gemini Structural Review (3 mitigations applied):**
 > 1. ~~Geodetic Type Erasure~~ → PhantomData `Coordinate<D>` deferred to v0.9
@@ -29,268 +50,234 @@
 
 ---
 
-# v0.3 — Terrain-Following Trajectory Generation
+# v0.3.2 — Audit Remediation
 
-> Prerequisites: v0.2 complete. Corridors, Dubins turns, and TSP routing
-> implemented. The engine can generate flat-plane and stepped flight lines.
-> This release adds dynamically feasible, jerk-free terrain-following
-> trajectories via the two-stage hybrid algorithm from Doc 34.
+> Prerequisites: v0.3.1 complete and tagged on GitHub.
+> Source: v0.3.1 architecture audit (March 2026).
+>
+> This is a focused bug-fix and test-gap release. No new features.
+> Each task below is atomic and independently mergeable.
 
 ---
 
-## PHASE 5A: Elastic Band Energy Minimization
+## TASK A1: Fix NMEA Latitude/Longitude Parsing Bug
 
 ```
-Read docs/34_terrain_following_planning.md §3 (Elastic Band) and
-docs/09_dsm_vs_dtm.md.
+SEVERITY: CRITICAL — data corruption risk in telemetry pipeline.
 
-The current terrain-following logic steps altitudes per waypoint from
-the DEM. This produces a jagged trajectory that causes autopilot pitch
-chatter, destroys sensor stability, and violates load factor limits.
-This phase replaces it with a physically-modeled energy minimization.
+File: src/network/nmea.rs, lines 169–189.
+
+Bug: The formula `dot_pos.saturating_sub(2)` to split degrees from
+minutes does not account for NMEA's fixed-width format. NMEA latitude
+is ddmm.mmmm (2-digit degrees), longitude is dddmm.mmmm (3-digit
+degrees). The current code computes degree length from the decimal
+point position, which breaks for edge cases like single-digit degree
+values or non-standard formatting.
+
+Example: For latitude "5157.1200", dot_pos=4, deg_len=4-2=2, splits
+as "51" + "57.1200" — CORRECT. But for longitude "00830.5000",
+dot_pos=5, deg_len=5-2=3, splits as "008" + "30.5000" — CORRECT.
+However for malformed input "1.5", deg_len=1-2=0 (saturating), the
+entire string becomes minutes — WRONG with no error returned.
 
 Tasks:
 
-1. Create `src/trajectory/mod.rs` and `src/trajectory/elastic_band.rs`.
+1. Refactor the parse_nmea_coordinate function to accept a `deg_len`
+   parameter (2 for latitude, 3 for longitude) rather than inferring
+   it from dot position. The caller (parse_gga, parse_rmc) knows
+   which field it's parsing.
 
-2. Define the discrete node array:
-   - Input: the raw DEM-sampled terrain profile along a flight line
-     (Vec<f64> elevations at fixed along-track intervals, e.g., 10 m).
-   - Add target AGL offset to get the raw "ideal" path.
-   - Initialize the elastic band ABOVE the highest peak in the segment
-     (prevents local minima traps from ravines/overhangs).
+2. Add explicit validation:
+   - Reject inputs shorter than deg_len + 2 characters.
+   - Reject minutes >= 60.0.
+   - Return Option<f64>::None on any parse failure — NEVER default
+     to 0.0. Silent defaults mask position errors.
 
-3. Implement the energy functional with three force components:
-   a. TENSION springs (Hooke's law between adjacent nodes):
-      F_tension[i] = k_t × (dist(node[i-1], node[i+1]) - 2×spacing)
-      Drives the path to be short and straight.
-   b. TORSIONAL springs (bending penalty on 3 consecutive nodes):
-      F_torsion[i] = k_b × (angle(node[i-1], node[i], node[i+1]))
-      Enforces the curvature limit κ_max = a_max / V².
-   c. TERRAIN REPULSION (asymmetric one-sided barrier):
-      If node altitude < (terrain + min_AGL): massive upward force.
-      Use exponential decay: F_repulse = k_r × exp(-d/d_0) where
-      d = node_alt - (terrain_alt + min_AGL).
-   d. GRAVITY (weak constant downward pull):
-      Prevents the band from floating infinitely high. Magnitude
-      tuned so the band settles near the target survey AGL.
+3. Remove all `unwrap_or(0.0)` from the NMEA parser. Replace with
+   proper Option/Result propagation that logs the malformed sentence
+   before discarding it.
 
-4. Implement the gradient descent solver:
-   - Per iteration: compute net force on every node, displace by
-     η × F_net (learning rate η ≈ 0.5–1.0 m per iteration).
-   - Convergence: stop when max displacement < 0.01 m or after
-     max_iterations (default 500).
-   - The Jacobian is tridiagonal — only adjacent neighbors matter.
-
-5. Translate aircraft dynamic limits to geometric parameters:
-   Accept a `KinematicLimits` struct:
-   ```rust
-   pub struct KinematicLimits {
-       pub max_pitch_deg: f64,      // 10–15° typical
-       pub max_vert_accel_g: f64,   // 0.5–1.0 g typical
-       pub max_pitch_rate_dps: f64, // 3–5°/s typical
-       pub survey_speed_ms: f64,    // Ground speed
-   }
-   ```
-   Derive: max_slope = tan(max_pitch_deg.to_radians()),
-   κ_max = (max_vert_accel_g × 9.81) / survey_speed_ms².
-   Use these to set k_b (torsional coefficient).
-
-6. Use rayon par_iter for the force computation (each node's forces
-   depend only on neighbors — embarrassingly parallel).
-   SoA memory layout for node positions.
-
-7. Tests:
-   - Flat terrain: band converges to exact target AGL, zero curvature.
-   - Single step function (cliff): band projects a climb ramp starting
-     well before the cliff base, governed by max_slope.
-   - Verify convergence in < 500 iterations for a 3,000-node line.
-
-Architecture: This is synchronous rayon work. Never call from async.
+4. Tests:
+   - Standard GGA latitude: "4807.038" → 48.1173°
+   - Standard GGA longitude: "01131.000" → 11.51667°
+   - Edge case: "00530.000" (5°30') → 5.5°
+   - Edge case: "18000.000" (180°00') → 180.0°
+   - Malformed: "1.5" → None (not 0.0)
+   - Malformed: "4860.000" (minutes >= 60) → None
+   - Verify NMEA checksum validation rejects corrupted sentences.
 ```
 
 ---
 
-## PHASE 5B: Cubic B-Spline Fitting with Convex Hull Safety
+## TASK A2: Fix mDNS Service Discovery Bind Address
 
 ```
-Read docs/34_terrain_following_planning.md §4 (B-Spline) and §Rust Crates.
+SEVERITY: HIGH — feature completely non-functional.
 
-The Elastic Band output is a discrete sequence of nodes. Its higher-order
-derivatives are noisy finite differences. This phase wraps the EB output
-in a C² continuous analytical curve.
+File: src/network/server.rs, line 131.
+
+Bug: The daemon advertises via mDNS (_irontrack._tcp.local.) but
+registers the service with IP address 127.0.0.1 (loopback). This
+makes the daemon undiscoverable from any other device on the network,
+which defeats the entire purpose of mDNS service discovery for the
+FMS use case (ground station connecting over WiFi).
 
 Tasks:
 
-1. Create `src/trajectory/bspline_smooth.rs`.
+1. Replace the hardcoded "127.0.0.1" with actual local network
+   interface IP discovery. Use one of:
+   a. `local-ip-address` crate (lightweight, cross-platform).
+   b. `pnet` crate's datalink/network interface enumeration.
+   c. `if-addrs` crate for interface address listing.
+   Prefer the lightest option. Exclude loopback and link-local
+   addresses. If multiple non-loopback interfaces exist, prefer
+   the one with a default gateway.
 
-2. Add dependencies:
-   ```toml
-   bspline = "2"     # or nalgebra-based custom Cox-de Boor
-   nalgebra = "0.33"
-   ```
-   Do NOT use `spliny` (FFI to Fortran FITPACK — violates memory safety,
-   ARM cross-compilation issues).
+2. If no suitable interface is found, fall back to 0.0.0.0 and
+   log a warning (daemon still works via direct IP entry).
 
-3. Implement adaptive knot placement:
-   a. Compute discrete curvature at each EB node (finite difference
-      second derivative).
-   b. Identify dominant feature points: local curvature maxima
-      (peaks, valleys, cliff edges) above a threshold.
-   c. Place knots densely at feature points (e.g., every 20 m).
-   d. Place knots sparsely over flat terrain (e.g., every 200 m).
-   e. Return a non-uniform knot vector.
+3. Also bind the Axum listener to 0.0.0.0:<port> (not 127.0.0.1)
+   so the daemon is actually reachable from the network. Verify
+   this is already the case; if not, fix it.
 
-4. Fit a degree-3 (cubic) B-spline through the EB nodes using
-   least-squares with the adaptive knot vector. The control points
-   are solved via the normal equations.
-
-5. CRITICAL — Convex Hull AGL Enforcement:
-   After fitting, iterate over every control point. For each, query
-   the DEM at the control point's horizontal position. If the control
-   point altitude is less than (terrain + min_AGL), translate it
-   vertically upward until it clears. Because the B-spline curve lies
-   strictly within the convex hull of its control polygon, this
-   guarantees the ENTIRE curve clears minimum AGL.
-   This is not a heuristic — it is a mathematical proof.
-
-6. Implement B-spline evaluation:
-   - `evaluate(t: f64) -> (along_track_m: f64, altitude_m: f64)`
-   - Use the Cox-de Boor recursion formula.
-   - Support arc-length parameterization via Gaussian quadrature
-     (needed for Phase 5C look-ahead).
-
-7. Validate C² continuity: sample the curve at high density (every 1 m).
-   Compute slope (1st derivative) and curvature (2nd derivative) via
-   finite differences on the samples. Assert:
-   - |slope| ≤ max_slope at all points.
-   - |curvature| ≤ κ_max at all points.
-   - No discontinuous jumps in slope between adjacent samples.
-
-8. Output the smoothed trajectory as a new FlightLine with waypoints
-   sampled from the B-spline at the desired trigger interval.
-
-9. Tests:
-   - Sinusoidal terrain: verify curvature is clipped to κ_max.
-   - Sawtooth terrain: verify NO sampled point drops below min_AGL.
-   - Flat terrain: verify minimal knots and zero curvature.
+4. Tests:
+   - Verify mDNS advertisement contains a non-loopback IP.
+   - Verify the daemon accepts connections from non-loopback addresses.
 ```
 
 ---
 
-## PHASE 5C: Dynamic Look-Ahead Pure Pursuit
+## TASK A3: Add Datum Transform Tests (Safety-Critical Gap)
 
 ```
-Read docs/34_terrain_following_planning.md §Look-Ahead.
+SEVERITY: HIGH — 140 lines of altitude datum transform code with
+zero test coverage. This is safety-critical: wrong altitude datums
+produce wrong flight altitudes.
 
-The B-spline produces a perfect analytical path. The autopilot must
-track it using a pure pursuit algorithm with a dynamically varying
-look-ahead distance.
+File: src/datum.rs (140 LOC, 0 tests).
 
 Tasks:
 
-1. Create `src/trajectory/pursuit.rs`.
+1. Add unit tests to src/datum.rs (or tests/datum.rs) covering:
+   a. Identity transform: to_datum(current_datum) returns unchanged
+      values (verify the clone path at line 54 works correctly).
+   b. WGS84 Ellipsoidal → EGM2008 orthometric round-trip:
+      Convert a known point, convert back, verify recovery to < 1 mm.
+   c. WGS84 Ellipsoidal → EGM96 orthometric round-trip: same.
+   d. EGM2008 → EGM96 cross-conversion (via WGS84 pivot):
+      Verify the difference matches the known EGM2008-EGM96 undulation
+      delta at the test point.
+   e. AGL conversion: Provide a terrain elevation, verify
+      orthometric → AGL = orthometric - terrain.
+   f. Edge case: point at the EGM grid boundary (e.g., near the poles
+      or antimeridian).
+   g. Error case: verify appropriate error on unsupported datum path.
 
-2. Implement kinematic minimum look-ahead:
-   L_a_min = (Δh × V) / V_z_max
-   where Δh = upcoming terrain rise, V = ground speed,
-   V_z_max = max sustained climb rate.
+2. Use the `approx` crate for floating-point comparisons.
+   Tolerance: 1e-6 m for round-trips (sub-millimeter).
 
-3. Implement dynamic look-ahead adaptation:
-   a. CURVATURE-BASED: Compute the B-spline curvature at the
-      aircraft's current along-track position.
-      - Low curvature (flat): L_a = L_a_max (smooth, efficient).
-      - High curvature (ridge apex): L_a = L_a_min (tight tracking).
-      - Interpolate: L_a = L_a_min + (L_a_max - L_a_min) ×
-        (1 - κ_current / κ_max).
-   b. ERROR-BASED: If |altitude_error| > threshold:
-      L_a *= exp(-gain × |altitude_error|).
-      This aggressively tightens tracking when wind shear pushes
-      the aircraft off the planned profile.
-
-4. Implement the pursuit target resolver:
-   Given the aircraft's current along-track position s_current,
-   find the point on the B-spline at arc-length s_current + L_a.
-   Use Gaussian quadrature on the B-spline's arc-length integral.
-   Return the target (lat, lon, altitude) for the autopilot.
-
-5. This module is used by the glass cockpit (v0.6) to display the
-   target altitude bug on the VDI tape. For v0.3, expose it as
-   a library function — the daemon integration comes in v0.4/v0.6.
-
-6. Tests:
-   - Step function terrain: verify the pursuit target begins climbing
-     well BEFORE the cliff base (anticipatory behavior).
-   - Verify L_a contracts at high curvature and expands on flat terrain.
+3. Verify that rayon parallelism in to_datum() produces identical
+   results to sequential execution (determinism test).
 ```
 
 ---
 
-## PHASE 5D: Synthetic Validation Suite
+## TASK A4: Add R-Tree Spatial Index Tests (Safety-Critical Gap)
 
 ```
-Read docs/34_terrain_following_planning.md §Validation.
+SEVERITY: HIGH — 200 lines of spatial indexing code with zero test
+coverage. Silent R-tree failures would cause spatial queries to
+return wrong results (missing flight lines, incorrect airspace hits).
 
-Before any terrain-following code is merged, it must pass a deterministic
-synthetic test suite. These tests are the safety gate.
+File: src/gpkg/rtree.rs (213 LOC, 0 tests).
 
 Tasks:
 
-1. Create `tests/terrain_following_validation.rs`.
+1. Add unit tests covering:
+   a. Insert a single feature, query its bounding box, verify it's
+      returned.
+   b. Insert 100 features with known bounding boxes, verify
+      point-in-bbox queries return the correct subset.
+   c. Edge case: query outside all bounding boxes → empty result.
+   d. Edge case: overlapping bounding boxes → all overlapping
+      features returned.
+   e. Edge case: feature at the antimeridian (lon ~±180°).
+   f. Verify the R-tree trigger SQL is syntactically valid and
+      executes without error on a fresh GeoPackage.
 
-2. Implement four synthetic DEM profiles as test fixtures:
-   a. FLAT: constant elevation (e.g., 500 m). Zero slope.
-   b. SINUSOIDAL: y = A × sin(2π × x / λ) + baseline.
-      Parametric: vary A and λ to test progressively harder terrain.
-   c. STEP FUNCTION: flat at 500 m for 10 km, instantaneous rise to
-      800 m, flat at 800 m for 10 km.
-   d. SAWTOOTH: high-frequency triangle waves (e.g., 100 m amplitude,
-      500 m period).
+2. Use a temporary GeoPackage (tempfile crate) for each test.
+   Clean up automatically via TempDir drop.
+```
 
-3. For each profile, run the full pipeline:
-   raw DEM → Elastic Band → B-spline fit → sample at 1 m intervals.
+---
 
-4. Assert the following on every sampled point:
-   a. altitude ≥ terrain + min_AGL (NEVER violated — convex hull).
-   b. |slope| ≤ tan(max_pitch_deg) (pitch limit).
-   c. |curvature| ≤ κ_max (g-load limit).
-   d. No discontinuous jumps > 0.01 in slope between adjacent samples
-      (C² continuity proxy).
+## TASK A5: Housekeeping and Metadata Fixes
 
-5. Compute and print photogrammetric efficiency metrics:
-   - RMS deviation from ideal AGL (lower = tighter terrain-following).
-   - Max deviation from ideal AGL (identifies worst-case GSD error).
-   - Percentage of path within ±5% of ideal AGL.
+```
+SEVERITY: LOW — correctness and hygiene items.
 
-6. The sinusoidal test should be parametric: progressively increase
-   amplitude and decrease wavelength until the terrain EXCEEDS the
-   aircraft's kinematic envelope. Verify the B-spline gracefully
-   clips curvature to κ_max and increases AGL deviation rather than
-   violating the load factor.
+Tasks:
 
-Acceptance: All four profiles pass all assertions. This test suite runs
-in CI on every push and must never be disabled.
+1. Bump Cargo.toml version from "0.1.0" to "0.3.1" to match the
+   actual release tag on GitHub.
+
+2. Add PRAGMA optimize to daemon shutdown path:
+   File: src/network/server.rs
+   When the daemon receives SIGTERM/SIGINT (or the Axum server's
+   graceful shutdown future resolves), call:
+     conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")
+   before dropping the connection. This is required by the
+   architecture rules (VACUUM prohibited, PRAGMA optimize on shutdown).
+
+3. Add logging to silent defaults in server.rs:
+   - Line 431: `req.altitude_msl.unwrap_or(100.0)` → log::warn if
+     defaulting.
+   - Line 475-476: launch coordinate defaults → log::warn.
+   - Line 531: `corridor_passes.unwrap_or(3)` → log::warn.
+   These defaults are acceptable for prototyping but must be visible
+   to the operator.
+
+4. Fix the unnecessary .clone() in datum.rs line 54:
+   When input datum matches target datum, the current code returns
+   Ok(self.clone()) which copies the entire FlightLine (potentially
+   large). Refactor to return a reference, or use Cow<FlightLine>,
+   or restructure the caller to avoid the copy.
+
+5. Verify the Claude API model identifier in src/ai/client.rs:37
+   is correct for your Anthropic API tier. Current value:
+   "claude-sonnet-4-6". If this is intentional, no change needed.
+   If not, update to the model you want to use.
+
+6. Add CORS origin restriction TODO comment in server.rs:150:
+   The current CorsLayer::permissive() is fine for local dev but
+   must be restricted before any network-exposed deployment.
+   Add a TODO comment documenting this.
 ```
 
 ---
 
 # v0.4 — Networked FMS Daemon
 
-> Prerequisites: v0.3 complete. The engine generates dynamically feasible,
-> C²-continuous terrain-following trajectories.
+> Prerequisites: v0.3.2 audit remediation complete. The engine generates
+> dynamically feasible, C²-continuous terrain-following trajectories.
+> NMEA parsing is correct. Daemon networking is functional.
 >
 > ARCHITECTURE SHIFT: This release transitions IronTrack from a CLI tool
 > into a persistent, networked daemon. Tokio is now permitted for the
 > Axum server, WebSocket I/O, serial port polling, and NMEA ingestion.
-> Read Doc 28 (Daemon Design) thoroughly before starting.
+> Query local-rag: query_documents "daemon design REST WebSocket state management".
+> Source doc: Doc 28 (Daemon Design) — read thoroughly before starting.
 
 ---
 
 ## PHASE 6A: Axum Daemon, REST API, and Shared State
 
 ```
-Read docs/28_irontrack_daemon_design.md §1 (REST) and §3 (State).
-Read docs/42_geopackage_extensions.md §WAL and §Concurrency.
+Query jdocmunch: search_sections for "REST API" and "shared state" in
+docs/28_irontrack_daemon_design.md, then get_sections for §1 and §3.
+Query jdocmunch: search_sections for "WAL" and "concurrency" in
+docs/42_geopackage_extensions.md, then get_sections for §WAL and §Concurrency.
+Fallback: Read the full files directly if MCP results are insufficient.
 
 Tasks:
 
@@ -369,7 +356,8 @@ Tasks:
      Authorization header, verifies Bearer <token> via constant-time
      comparison. Returns 401 if invalid.
 
-7. Enable CORS via tower-http (allow all origins for dev).
+7. Enable CORS via tower-http. Restrict to localhost origins for dev
+   (do NOT use CorsLayer::permissive() — see audit task A5).
 
 8. Add CLI subcommand: `irontrack daemon --port 3000`.
    The existing `plan` subcommand is unchanged.
@@ -385,7 +373,9 @@ Tasks:
 ## PHASE 6B: WebSocket Telemetry and Hybrid Channels
 
 ```
-Read docs/28_irontrack_daemon_design.md §2 (WebSocket Architecture).
+Query jdocmunch: search_sections for "WebSocket architecture" in
+docs/28_irontrack_daemon_design.md, then get_section for §2.
+Fallback: Read docs/28_irontrack_daemon_design.md §2 directly.
 
 Tasks:
 
@@ -436,17 +426,23 @@ Tasks:
 ## PHASE 6C: NMEA Parsing and Serial Integration
 
 ```
-Read docs/23_nmea_data_requirements.md and
-docs/29_avionics_serial_communication.md §4 (Rust Serial).
+Query local-rag: query_documents "NMEA data requirements parsing GGA RMC"
+and "Rust serial port avionics communication".
+Query jdocmunch: search_sections for "Rust Serial" in
+docs/29_avionics_serial_communication.md, then get_section for §4.
+Source files: docs/23_nmea_data_requirements.md, docs/29_avionics_serial_communication.md.
+
+NOTE: NMEA parsing bug was fixed in audit task A1. This phase extends
+the parser and adds serial port integration.
 
 Tasks:
 
 1. Add dependencies:
    serialport = "4", tokio-serial = "5"
 
-2. Create `src/network/nmea.rs` and `src/network/serial_manager.rs`.
+2. Extend `src/network/nmea.rs` and `src/network/serial_manager.rs`.
 
-3. Implement NMEA sentence parser for:
+3. Extend NMEA sentence parser for:
    - GGA (position, fix quality, HDOP, MSL altitude, geoid separation)
    - RMC (ground speed, true course, date/time)
    - Optional: PTNL,GGK (Trimble 8-decimal precision, native EHT)
@@ -477,6 +473,7 @@ Tasks:
 7. Implement mDNS service discovery:
    - On daemon startup, advertise _irontrack._tcp.local. via mdns-sd.
    - Include port number and host IP in the advertisement.
+   - Use the non-loopback IP discovery from audit task A2.
    - Document the fallback chain: mDNS → cached IP → manual entry.
 
 8. Tests:
@@ -510,9 +507,10 @@ Acceptance: All integration tests pass. This suite runs in CI.
 
 # v0.5 — Atmospheric Kinematics and Energy Economy
 
-> Read Doc 16 (Wind Data), Doc 38 (UAV Endurance Modeling),
+> Query local-rag: query_documents "wind data endurance modeling wind-corrected Dubins".
+> Source docs: Doc 16 (Wind Data), Doc 38 (UAV Endurance Modeling),
 > Doc 50 (Wind-Corrected Dubins Paths).
-
+>
 > Prerequisites: v0.4 complete. The daemon is running, telemetry is flowing.
 
 ---
@@ -520,8 +518,11 @@ Acceptance: All integration tests pass. This suite runs in CI.
 ## PHASE 7A: Wind Vector Ingestion and Wind Triangle
 
 ```
-Read docs/16_aerial_wind_data.md, docs/03_photogrammetry_spec.md
-§Crab Angle, and docs/50_dubins_mathematical_extension.md §6 (Wind Correction).
+Query jdocmunch: search_sections for "crab angle" in docs/03_photogrammetry_spec.md
+and "wind correction" in docs/50_dubins_mathematical_extension.md, then get_sections for §Crab Angle and §6.
+Query local-rag: query_documents "aerial wind data wind triangle TAS ground speed".
+Source files: docs/16_aerial_wind_data.md, docs/03_photogrammetry_spec.md,
+docs/50_dubins_mathematical_extension.md.
 
 Wind Correction Angle: WCA = arcsin(V_crosswind / V_TAS) [Doc 50]
 Wind-corrected turn radius: r_safe = (V_TAS + V_wind)² / (g × tan(φ_max)) [Doc 50]
@@ -560,8 +561,10 @@ Tasks:
 ## PHASE 7B: Crab Angle Compensation for Swath Width
 
 ```
-Read docs/03_photogrammetry_spec.md §Crab Angle and
-docs/21_dynamic_footprint_geometry.md.
+Query jdocmunch: search_sections for "crab angle swath width" in
+docs/03_photogrammetry_spec.md and get_section for §Crab Angle.
+Query local-rag: query_documents "dynamic footprint geometry crab angle".
+Source files: docs/03_photogrammetry_spec.md, docs/21_dynamic_footprint_geometry.md.
 
 Tasks:
 
@@ -589,7 +592,9 @@ Tasks:
 ## PHASE 8A: Aerodynamic Drag Model
 
 ```
-Read docs/17_uav_survey_analysis.md §Kinematics and
+Query jdocmunch: search_sections for "kinematics" in docs/17_uav_survey_analysis.md.
+Query local-rag: query_documents "UAV endurance power model battery Peukert drag polar energy costing".
+Source files: docs/17_uav_survey_analysis.md §Kinematics,
 docs/38_uav_endurance_modeling.md (complete document — power models,
 battery electrochemistry, per-segment energy costing).
 
@@ -631,7 +636,9 @@ Tasks:
 ## PHASE 8B: Energy-Optimized TSP Routing
 
 ```
-Read docs/17_uav_survey_analysis.md §2.2.
+Query jdocmunch: search_sections for "energy-optimized TSP" in
+docs/17_uav_survey_analysis.md, then get_section for §2.2.
+Source file: docs/17_uav_survey_analysis.md §2.2.
 
 Replace the TSP solver's edge weight from geodesic distance to energy
 cost (Phase 8A). The cost function is now asymmetric with wind.
@@ -661,15 +668,18 @@ Architecture: synchronous rayon work. spawn_blocking from Axum.
 > Prerequisites: v0.5 complete. The daemon runs with REST, WebSocket,
 > and NMEA telemetry.
 >
-> Read Doc 25 (Cockpit Display Design) and Doc 26 (Tauri Integration)
-> thoroughly before starting.
+> Query local-rag: query_documents "cockpit display design Tauri integration".
+> Source docs: Doc 25 (Cockpit Display Design) and Doc 26 (Tauri Integration).
+> Read thoroughly before starting.
 
 ---
 
 ## PHASE 9A: Tauri Application Shell and Daemon Embedding
 
 ```
-Read docs/26_tauri_integration.md §1–§3.
+Query jdocmunch: search_sections for "Tauri application shell daemon embedding" in
+docs/26_tauri_integration.md, then get_sections for §1, §2, and §3.
+Source file: docs/26_tauri_integration.md §1–§3.
 
 Tasks:
 
@@ -722,7 +732,9 @@ Tasks:
 ## PHASE 9B: Track Vector CDI and Block Overview
 
 ```
-Read docs/25_aircraft_cockpit_design.md §2 (CDI) and §4 (Colors).
+Query jdocmunch: search_sections for "CDI cross-track" and "color standards" in
+docs/25_aircraft_cockpit_design.md, then get_sections for §2 and §4.
+Source file: docs/25_aircraft_cockpit_design.md §2 (CDI) and §4 (Colors).
 
 Tasks:
 
@@ -759,7 +771,9 @@ Tasks:
 ## PHASE 9C: Altitude Guidance and Terrain Warnings
 
 ```
-Read docs/25_aircraft_cockpit_design.md §3 (Altitude) and §6 (Basemaps).
+Query jdocmunch: search_sections for "altitude tape" and "basemap" in
+docs/25_aircraft_cockpit_design.md, then get_sections for §3 and §6.
+Source file: docs/25_aircraft_cockpit_design.md §3 (Altitude) and §6 (Basemaps).
 
 Tasks:
 
@@ -784,7 +798,9 @@ Tasks:
 ## PHASE 9D: Airspace and Obstacle Cockpit Overlay
 
 ```
-Read docs/35_airspace_obstacle_data.md §Cockpit Alerting.
+Query jdocmunch: search_sections for "cockpit alerting" in
+docs/35_airspace_obstacle_data.md, then get_section for §Cockpit Alerting.
+Source file: docs/35_airspace_obstacle_data.md §Cockpit Alerting.
 
 Tasks:
 
@@ -815,14 +831,17 @@ Tasks:
 
 > Prerequisites: v0.6 complete. The glass cockpit is functional.
 >
-> Read Doc 27 (Web UI Plan) and Doc 35 (Airspace/Obstacles).
+> Query local-rag: query_documents "web planning UI airspace obstacle integration".
+> Source docs: Doc 27 (Web UI Plan) and Doc 35 (Airspace/Obstacles).
 
 ---
 
 ## PHASE 10A: React + MapLibre Foundation
 
 ```
-Read docs/27_web_ui_plan.md §1 (Map Library).
+Query jdocmunch: search_sections for "map library" in
+docs/27_web_ui_plan.md, then get_section for §1.
+Source file: docs/27_web_ui_plan.md §1 (Map Library).
 
 Tasks:
 
@@ -850,7 +869,9 @@ Tasks:
 ## PHASE 10B: Real-Time Streaming Plan Preview
 
 ```
-Read docs/27_web_ui_plan.md §3 (Streaming Preview).
+Query jdocmunch: search_sections for "streaming preview" in
+docs/27_web_ui_plan.md, then get_section for §3.
+Source file: docs/27_web_ui_plan.md §3 (Streaming Preview).
 
 Tasks:
 
@@ -878,7 +899,9 @@ Tasks:
 ## PHASE 10C: Export and Batch Download
 
 ```
-Read docs/27_web_ui_plan.md §5 (Export).
+Query jdocmunch: search_sections for "export" in
+docs/27_web_ui_plan.md, then get_section for §5.
+Source file: docs/27_web_ui_plan.md §5 (Export).
 
 Tasks:
 
@@ -900,7 +923,9 @@ Tasks:
 ## PHASE 10D: Multi-User Collaboration
 
 ```
-Read docs/27_web_ui_plan.md §6 (Collaboration).
+Query jdocmunch: search_sections for "collaboration" in
+docs/27_web_ui_plan.md, then get_section for §6.
+Source file: docs/27_web_ui_plan.md §6 (Collaboration).
 
 Tasks:
 
@@ -921,7 +946,9 @@ Tasks:
 ## PHASE 10E: Airspace and Obstacle Planning Overlay
 
 ```
-Read docs/35_airspace_obstacle_data.md §1–§5.
+Query jdocmunch: search_sections for "airspace boundary" and "obstacle" in
+docs/35_airspace_obstacle_data.md, then get_sections for §1 through §5.
+Source file: docs/35_airspace_obstacle_data.md §1–§5.
 
 Tasks:
 
@@ -953,8 +980,11 @@ Tasks:
 ## PHASE 10F: Sensor Library and Boundary Import Enhancements
 
 ```
-Read docs/45_aerial_sensor_library.md, docs/43_boundary_import_formats.md,
-and docs/49_computational_geometry_primitives.md.
+Query local-rag: query_documents "aerial sensor library irontrack_sensors schema"
+and "boundary import formats DXF CSV-WKT Shapefile" and "computational geometry
+point-in-polygon clipping buffer".
+Source files: docs/45_aerial_sensor_library.md, docs/43_boundary_import_formats.md,
+docs/49_computational_geometry_primitives.md.
 
 Tasks:
 
@@ -998,7 +1028,8 @@ Tasks:
 
 > Prerequisites: v0.7 complete. The full office→cockpit pipeline works.
 >
-> Read Doc 22 (Trigger Controller), Doc 23 (NMEA Requirements),
+> Query local-rag: query_documents "embedded trigger controller NMEA serial sensor LiDAR".
+> Source docs: Doc 22 (Trigger Controller), Doc 23 (NMEA Requirements),
 > Doc 29 (Serial Communication), Doc 40 (Sensor Trigger Library),
 > Doc 41 (LiDAR System Control).
 
@@ -1007,9 +1038,13 @@ Tasks:
 ## PHASE 11A: Firmware Foundation — NMEA Parser and Dead Reckoning
 
 ```
-Read docs/22_embedded_trigger_controller.md §2–§4,
+Query jdocmunch: search_sections for "NMEA parser" and "dead reckoning" and "PPS"
+in docs/22_embedded_trigger_controller.md, then get_sections for §2, §3, §4.
+Query local-rag: query_documents "sensor trigger library GPIO opto-isolated pulse"
+and "LiDAR system control dual-trigger".
+Source files: docs/22_embedded_trigger_controller.md §2–§4,
 docs/23_nmea_data_requirements.md, docs/40_sensor_trigger_library.md,
-and docs/41_lidar_system_control.md.
+docs/41_lidar_system_control.md.
 
 WORKSPACE ISOLATION MANDATE [Doc 51 — Gemini Criticism 3]:
 ───────────────────────────────────────────────────────────
@@ -1069,7 +1104,9 @@ Tasks:
 ## PHASE 11B: Spatial Firing Algorithm
 
 ```
-Read docs/22_embedded_trigger_controller.md §5 (Firing Algorithm).
+Query jdocmunch: search_sections for "firing algorithm" in
+docs/22_embedded_trigger_controller.md, then get_section for §5.
+Source file: docs/22_embedded_trigger_controller.md §5 (Firing Algorithm).
 
 Tasks:
 
@@ -1097,7 +1134,9 @@ Tasks:
 ## PHASE 11C: Serial Protocol — Daemon Communication
 
 ```
-Read docs/29_avionics_serial_communication.md §2 (Binary Protocol).
+Query jdocmunch: search_sections for "binary protocol" in
+docs/29_avionics_serial_communication.md, then get_section for §2.
+Source file: docs/29_avionics_serial_communication.md §2 (Binary Protocol).
 
 Tasks:
 
@@ -1127,7 +1166,9 @@ Tasks:
 ## PHASE 11D: MAVLink Hybrid Path for UAVs
 
 ```
-Read docs/29_avionics_serial_communication.md §3 (MAVLink).
+Query jdocmunch: search_sections for "MAVLink" in
+docs/29_avionics_serial_communication.md, then get_section for §3.
+Source file: docs/29_avionics_serial_communication.md §3 (MAVLink).
 
 Tasks:
 
@@ -1173,7 +1214,8 @@ Tasks:
 
 > Prerequisites: v0.8 complete. The full embedded pipeline works.
 >
-> Read Doc 30 (Geodetic Datum Transformation), Doc 31 (NAD83 Epochs),
+> Query local-rag: query_documents "geodetic datum Helmert NAD83 epoch geoid 3DEP".
+> Source docs: Doc 30 (Geodetic Datum Transformation), Doc 31 (NAD83 Epochs),
 > Doc 32 (Geoid Interpolation), Doc 33 (3DEP Integration).
 
 ---
@@ -1181,7 +1223,10 @@ Tasks:
 ## PHASE 12A: GEOID18 Binary Grid Parser
 
 ```
-Read docs/30_geodetic_datum_transformation.md §3 (Binary Grid) and
+Query jdocmunch: search_sections for "binary grid GEOID18" in
+docs/30_geodetic_datum_transformation.md and "GEOID18" in
+docs/32_geoid_interpolation_survey.md, then get_sections for §3 and §GEOID18.
+Source files: docs/30_geodetic_datum_transformation.md §3 (Binary Grid),
 docs/32_geoid_interpolation_survey.md §GEOID18.
 
 Tasks:
@@ -1228,7 +1273,10 @@ Tasks:
 ## PHASE 12B: 14-Parameter Helmert Transformation
 
 ```
-Read docs/30_geodetic_datum_transformation.md §2 (Helmert) and
+Query jdocmunch: search_sections for "Helmert transformation" in
+docs/30_geodetic_datum_transformation.md and "Helmert coefficients" in
+docs/31_nad83_epoch_management.md, then get_sections for §2 and §Helmert Coefficients.
+Source files: docs/30_geodetic_datum_transformation.md §2 (Helmert),
 docs/31_nad83_epoch_management.md §Helmert Coefficients.
 
 Tasks:
@@ -1269,7 +1317,9 @@ Tasks:
 ## PHASE 12C: 3DEP COG Ingestion Pipeline
 
 ```
-Read docs/33_3dep_data_integration.md §2–§4.
+Query jdocmunch: search_sections for "3DEP COG ingestion" in
+docs/33_3dep_data_integration.md, then get_sections for §2, §3, and §4.
+Source file: docs/33_3dep_data_integration.md §2–§4.
 
 Tasks:
 
@@ -1308,7 +1358,10 @@ Tasks:
 ## PHASE 12D: Multi-Source Terrain Fusion
 
 ```
-Read docs/33_3dep_data_integration.md §6 (Fusion) and
+Query jdocmunch: search_sections for "terrain fusion" in
+docs/33_3dep_data_integration.md and "canonical pivot" in
+docs/30_geodetic_datum_transformation.md, then get_sections for §6 and §4.
+Source files: docs/33_3dep_data_integration.md §6 (Fusion),
 docs/30_geodetic_datum_transformation.md §4 (Canonical Pivot).
 
 Tasks:
@@ -1339,7 +1392,10 @@ Tasks:
 ## PHASE 12E: PhantomData Datum Type Safety — Design Note and Performance Architecture
 
 ```
-Read docs/37_aviation_safety_principles.md §PhantomData,
+Query jdocmunch: search_sections for "PhantomData" in
+docs/37_aviation_safety_principles.md.
+Query local-rag: query_documents "geospatial performance Rust SoA Kahan Criterion benchmark".
+Source files: docs/37_aviation_safety_principles.md §PhantomData,
 docs/52_geospatial_performance_rust.md, and the working Rust compiler
 proof in docs/design/phantom_datum_types.md.
 
@@ -1375,7 +1431,8 @@ Tasks:
 
 > Prerequisites: v0.9 complete. The full US-domestic pipeline works.
 >
-> Read Doc 24 (PPK Integration), Doc 31 (NAD83 Epoch Management),
+> Query local-rag: query_documents "PPK ASPRS testing post-flight QC GPLv3 compliance".
+> Source docs: Doc 24 (PPK Integration), Doc 31 (NAD83 Epoch Management),
 > Doc 36 (ASPRS Standards), Doc 44 (Testing Strategy),
 > Doc 46 (Post-Flight QC), Doc 51 (GPLv3 Compliance).
 
@@ -1384,7 +1441,8 @@ Tasks:
 ## PHASE 13A: PPK Pulse Routing and Event Logging
 
 ```
-Read docs/24_survey_photogrammetry_ppk.md.
+Query local-rag: query_documents "PPK pulse routing event logging hot-shoe GNSS".
+Source file: docs/24_survey_photogrammetry_ppk.md.
 
 Tasks:
 
@@ -1411,7 +1469,10 @@ Tasks:
 ## PHASE 13B: Eagle Mapping Production Validation
 
 ```
-Read docs/44_irontrack_testing_strategy.md §7 (Field Acceptance) and
+Query jdocmunch: search_sections for "field acceptance" in
+docs/44_irontrack_testing_strategy.md, then get_section for §7.
+Query local-rag: query_documents "ASPRS 2024 accuracy standard RMSE checkpoint".
+Source files: docs/44_irontrack_testing_strategy.md §7 (Field Acceptance),
 docs/36_asprs_data_standards.md.
 
 Tasks:
@@ -1469,7 +1530,9 @@ Tasks:
 ## PHASE 13D: Post-Flight QC and Automated Re-Fly Planning
 
 ```
-Read docs/46_post_flight_qc.md and docs/49_computational_geometry_primitives.md.
+Query local-rag: query_documents "post-flight QC cross-track error XTE footprint coverage"
+and "computational geometry Sutherland-Hodgman Weiler-Atherton winding number".
+Source files: docs/46_post_flight_qc.md, docs/49_computational_geometry_primitives.md.
 
 Tasks:
 
@@ -1517,7 +1580,8 @@ Tasks:
 ## PHASE 13E: GPLv3 Compliance and Community Release
 
 ```
-Read docs/51_gplv3_compliance.md.
+Query local-rag: query_documents "GPLv3 compliance license audit SSPL cargo-deny IPC bridge".
+Source file: docs/51_gplv3_compliance.md.
 
 Tasks:
 
