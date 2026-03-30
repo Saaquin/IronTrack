@@ -287,6 +287,21 @@ fn apply_pool_pragmas(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error
     )
 }
 
+/// Check whether a `rusqlite::Error` is SQLITE_BUSY using the structured
+/// error code rather than fragile string matching. [Audit F3]
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::DatabaseBusy,
+                ..
+            },
+            _
+        )
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Server entry point
 // ---------------------------------------------------------------------------
@@ -1143,9 +1158,11 @@ async fn handle_client_msg(text: String, state: &SharedState) {
 /// a fatal architectural violation [Doc 42] — logged at error level.
 pub async fn run_persistence_task(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut tick_count: u64 = 0;
 
     loop {
         interval.tick().await;
+        tick_count += 1;
 
         let (pool, statuses) = {
             let state_guard = state.read().await;
@@ -1180,9 +1197,7 @@ pub async fn run_persistence_task(state: SharedState) {
                         match result {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
-                                let msg = e.to_string();
-                                if msg.contains("SQLITE_BUSY") || msg.contains("database is locked")
-                                {
+                                if is_sqlite_busy(&e) {
                                     log::error!("FATAL: SQLITE_BUSY in persistence task: {e}");
                                 } else {
                                     log::warn!("persistence write failed: {e}");
@@ -1208,6 +1223,37 @@ pub async fn run_persistence_task(state: SharedState) {
                         }
                     })
                     .await;
+                }
+            }
+        }
+
+        // Periodic PASSIVE WAL checkpoint every ~60 seconds (12 ticks × 5s).
+        // PASSIVE is non-blocking: it checkpoints only pages not currently
+        // needed by readers, safe during active flight. [Audit F5, Doc 42]
+        if tick_count.is_multiple_of(12) {
+            let ckpt_pool = state.read().await.db_pool.clone();
+            if let Some(pool) = ckpt_pool {
+                match pool.get().await {
+                    Ok(conn) => {
+                        let result = conn
+                            .interact(|conn| {
+                                apply_pool_pragmas(conn)?;
+                                conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+                            })
+                            .await;
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                if is_sqlite_busy(&e) {
+                                    log::error!("FATAL: SQLITE_BUSY during WAL checkpoint: {e}");
+                                } else {
+                                    log::warn!("WAL checkpoint failed: {e}");
+                                }
+                            }
+                            Err(e) => log::warn!("WAL checkpoint interact failed: {e}"),
+                        }
+                    }
+                    Err(e) => log::warn!("WAL checkpoint pool.get() failed: {e}"),
                 }
             }
         }

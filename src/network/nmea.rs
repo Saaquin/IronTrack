@@ -166,15 +166,17 @@ fn extract_gga_epoch(fields: &[&str]) -> Option<GgaEpoch> {
         return None; // Cannot pair without UTC
     };
 
-    // Reject the entire epoch if critical positional fields are missing.
+    // Reject the entire epoch if critical fields are missing or unparseable.
+    // Altitude and geoid separation are safety-critical — a silent 0.0 default
+    // is indistinguishable from a legitimate sea-level reading. [Audit F2]
     // Non-critical fields (HDOP, satellites) fall back to safe defaults.
     let lat = parse_nmea_coordinate(fields[2], fields[3], 2)?;
     let lon = parse_nmea_coordinate(fields[4], fields[5], 3)?;
     let fix_quality = fields[6].parse::<u8>().ok()?;
     let satellites_in_use = fields[7].parse::<u8>().unwrap_or(0);
     let hdop = fields[8].parse::<f64>().unwrap_or(99.9);
-    let alt = fields[9].parse::<f64>().unwrap_or(0.0);
-    let geoid_separation_m = fields[11].parse::<f64>().unwrap_or(0.0);
+    let alt = fields[9].parse::<f64>().ok()?;
+    let geoid_separation_m = fields[11].parse::<f64>().ok()?;
 
     Some(GgaEpoch {
         utc_time,
