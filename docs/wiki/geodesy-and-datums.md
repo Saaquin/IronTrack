@@ -157,6 +157,15 @@ Tectonic plate drift accumulates ~2.5 cm/year (40 cm over 16 years). IronTrack r
 
 IronTrack uses Karney's ellipsoidal polygon method for all area computations (hectares, acres). The Shoelace formula applied to UTM coordinates introduces ~3.5% error for large regions and fails entirely across zone boundaries.
 
+### NMEA Telemetry and Datum Tagging (v0.4)
+
+When the daemon ingests live NMEA telemetry, altitude datum tagging depends on the sentence type:
+
+- **GGA:** Reports orthometric height above the receiver's internal geoid model. For most consumer and survey receivers (u-blox, Trimble), this is EGM96. The parser tags these readings as `AltitudeDatum::Egm96`.
+- **Trimble $PTNL,GGK:** Reports native WGS84 ellipsoidal height. Tagged as `AltitudeDatum::Wgs84Ellipsoidal`. This is the most accurate path because it bypasses the geoid model entirely.
+
+Correct datum tagging ensures that the downstream `to_datum()` conversion applies the right undulation correction when converting telemetry altitudes to the mission's working datum. A mismatch (e.g., treating EGM2008 heights as EGM96) would introduce 1-2 m of systematic error in the altitude display.
+
 ### Reference Documents
 
 - `02_geodesy_foundations.md` — Algorithm selection rationale.

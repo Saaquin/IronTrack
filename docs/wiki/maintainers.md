@@ -1,6 +1,6 @@
 # Maintainers
 
-## Core Engine Architecture (v0.3.1)
+## Core Engine Architecture (v0.4.0)
 
 The IronTrack engine is ~40,000 lines of Rust across 44 source files organized into 11 modules. All compute is synchronous and parallelized via `rayon`; `tokio` is reserved for network I/O in the daemon layer.
 
@@ -49,12 +49,13 @@ The IronTrack engine is ~40,000 lines of Rust across 44 source files organized i
 
 `FlightLine::to_datum()` converts between EGM2008, EGM96, WGS84 Ellipsoidal, and AGL altitude references. All transforms happen at ingestion time (never during flight execution). WGS84 Ellipsoidal is the canonical pivot datum. Parallelized via `rayon`.
 
-### 8. Network Daemon (`src/network/`) — v0.4 Target
+### 8. Network Daemon (`src/network/`) — v0.4 Complete
 
-- `server.rs` (1,004 lines): Axum REST API + WebSocket server. REST endpoints under `/api/v1/` for mission CRUD, terrain queries, and route optimization. WebSocket at `/ws` for 10 Hz telemetry broadcast using `tokio::sync::broadcast` and `watch` channels.
-- `nmea.rs` (239 lines): NMEA sentence parser for GPS telemetry decoding.
-- `telemetry.rs` (57 lines): Data structures for `CurrentState`, `SystemStatus`, `LineStatus`.
-- `serial_manager.rs` (102 lines): USB serial port manager with VID/PID auto-detection (u-blox, CP2102/FTDI). Feature-gated behind `serial`.
+- `server.rs` (~1,850 lines): Axum REST API + WebSocket server. REST endpoints under `/api/v1/` for mission CRUD, export (GeoPackage streaming, QGC, DJI), and route optimization. WebSocket at `/ws` with discriminated `ServerMsg` envelope (INIT, TELEMETRY, STATUS, TRIGGER, WARNING). Bearer token auth via `subtle::ConstantTimeEq`. `deadpool-sqlite` connection pool with per-connection WAL PRAGMAs. Background persistence task (5-second line completion writes + 60-second PASSIVE WAL checkpoints). SQLITE_BUSY detection via `rusqlite::ffi::ErrorCode::DatabaseBusy` with fail-safe shutdown. mDNS advertising via `mdns-sd`. Mock telemetry mode. Graceful shutdown with `PRAGMA optimize` + `wal_checkpoint(TRUNCATE)`.
+- `nmea.rs` (~350 lines): Stateful epoch-pairing NMEA parser. GGA/RMC sentence types with Trimble $PTNL,GGK extension. 2-digit/3-digit degree field parsing, hemisphere validation, XOR checksum verification. Rejects entire epoch on malformed altitude (no silent 0.0 defaults).
+- `telemetry.rs` (~109 lines): Data structures for `CurrentState`, `SystemStatus`, `LineStatus`, `TriggerEvent`, and the `ServerMsg` discriminated enum.
+- `serial_manager.rs` (~370 lines): Async USB serial port manager with VID/PID auto-detection (u-blox, CP2102/FTDI; CH340 rejected). 5-step hot-plug recovery. RTK degradation detection with 20-epoch debouncing and WebSocket broadcast. 3-second heartbeat watchdog. Feature-gated behind `serial`.
+- `errors.rs`: Structured `ServerError` enum mapping to HTTP status codes with machine-readable `code` fields (e.g., `ERR_GEOID_MISSING`, `ERR_DB_LOCKED`). SQLITE_BUSY mapped to 503.
 
 ### 9. AI Integration (`src/ai/`)
 
@@ -74,7 +75,7 @@ src/
 ├── dem/                 # mod.rs (TerrainEngine), copernicus.rs, cache.rs
 ├── math/                # dubins.rs, geometry.rs, numerics.rs, routing.rs
 ├── trajectory/          # elastic_band.rs, bspline_smooth.rs, pursuit.rs, validation.rs
-├── network/             # server.rs, telemetry.rs, nmea.rs, serial_manager.rs
+├── network/             # server.rs, telemetry.rs, nmea.rs, serial_manager.rs, errors.rs
 ├── photogrammetry/      # sensor.rs, flightlines.rs, corridor.rs, lidar.rs
 ├── gpkg/                # init.rs, binary.rs, rtree.rs
 ├── io/                  # geojson.rs, kml.rs, qgc.rs, dji.rs
@@ -92,7 +93,7 @@ src/
 - **Karney Only.** Geodesic distance via Karney. No Haversine. No Vincenty.
 - **WAL Mandatory.** Every SQLite connection sets `PRAGMA journal_mode = WAL`. SQLITE_BUSY is a fatal violation. No VACUUM in flight.
 - **GPLv3 Headers.** Every `.rs` file must include `SPDX-License-Identifier: GPL-3.0-or-later` in the first 3 lines. Trigger controller firmware uses MIT.
-- **Error Propagation.** Functions that can fail return `Result<T, E>`. No silent `unwrap_or(default)` on mission-critical values without `log::warn!`.
+- **Error Propagation.** Functions that can fail return `Result<T, E>`. No silent `unwrap_or(default)` on mission-critical values without `log::warn!`. In the NMEA parser specifically, malformed altitude or geoid fields reject the entire epoch rather than defaulting to 0.0 (which is indistinguishable from a legitimate sea-level reading).
 
 ## Testing
 
@@ -109,7 +110,7 @@ src/
 | `gpkg.rs` | GeoPackage creation, spatial indexing |
 | `io.rs` | KML/GeoJSON parsing |
 | `v02_integration.rs` | Full integration (Phantom 4 Pro, 3 cm GSD) |
-| `daemon_integration.rs` | FMS server startup, endpoint tests |
+| `daemon_integration.rs` | 15 tests: REST CRUD, WebSocket init/telemetry/status, token auth (401), RTK warning, WAL recovery, export streaming |
 | `photogrammetry.rs` | GSD, swath, overlap validation |
 
 Run all checks with:
@@ -127,12 +128,9 @@ cargo test
 - **v0.1 — Foundation:** DEM ingestion, flight lines, GeoPackage/GeoJSON, Karney geodesics, EGM2008.
 - **v0.2 — Correctness & Safety:** Datum-tagged altitudes, EGM96, DSM warnings, QGC/DJI/KML exports, corridor support, Dubins paths, LiDAR planning, TSP routing.
 - **v0.3 — Terrain-Following Trajectories:** Elastic Band + B-spline C² curves, convex hull safety, dynamic pursuit, synthetic validation suite.
+- **v0.4 — Networked Daemon:** Axum REST/WebSocket API with discriminated `ServerMsg` envelope, NMEA epoch-pairing parser (GGA/RMC/Trimble GGK), mDNS service discovery, RTK degradation detection with debounced WebSocket broadcast, USB VID/PID auto-detection with 5-step hot-plug recovery, ephemeral bearer token auth (constant-time comparison), `deadpool-sqlite` connection pool with WAL PRAGMAs and periodic PASSIVE checkpoints, SQLITE_BUSY fail-safe shutdown, mock telemetry mode, 15 integration tests covering the full daemon lifecycle.
 
-### In Progress
-
-- **v0.4 — Networked Daemon:** Axum REST/WebSocket API, NMEA parsing, mDNS service discovery, RTK degradation handling, USB VID/PID auto-detection, hot-plug serial, ephemeral token auth, WAL persistence. (Scaffolding complete — validation and field-hardening in progress.)
-
-### Planned
+### Next
 
 - **v0.5 — Atmospheric & Energy:** Wind triangle, crab angle, drag models, battery endurance, 20% reserve enforcement.
 - **v0.6 — Glass Cockpit MVP:** Tauri 2.0, Track Vector CDI, Canvas 2D rendering, WebSocket telemetry display.

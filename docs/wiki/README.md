@@ -17,7 +17,7 @@ This wiki is the human-readable layer above the 52 research documents in `docs/`
 - [Flight Planning](flight-planning) — Area surveys, corridor mapping, LiDAR missions, sensor geometry, Dubins turns, TSP route optimization.
 - [Daemon & API](daemon-and-api) — REST endpoints, WebSocket telemetry, NMEA parsing, serial manager, mDNS discovery, state management.
 
-## Current Engine State (v0.3.1)
+## Current Engine State (v0.4.0)
 
 The IronTrack Core Engine is a high-performance headless CLI and networked daemon built in Rust (~40,000 lines across 44 source files). Current capabilities:
 
@@ -28,14 +28,14 @@ The IronTrack Core Engine is a high-performance headless CLI and networked daemo
 - **Kinematics:** Dubins path procedure turns (LSL, RSR, LSR, RSL, LRL, RLR) with clothoid transitions and jerk-limited roll.
 - **Route Optimization:** Nearest-neighbor + 2-opt TSP heuristic with Karney geodesic cost matrix.
 - **I/O:** 3D GeoPackage (LINESTRINGZ with R-tree), RFC 7946 GeoJSON, QGroundControl `.plan`, DJI `.kmz`, KML/KMZ import.
-- **Daemon (v0.4 scaffold):** Axum REST API + WebSocket telemetry server, NMEA parser, USB serial manager with VID/PID auto-detection, mock telemetry mode.
+- **Networked Daemon (v0.4):** Axum REST API (`/api/v1/`) and WebSocket telemetry (10 Hz broadcast). NMEA parser (GGA/RMC/Trimble GGK) with stateful epoch pairing. USB serial manager with VID/PID auto-detection, hot-plug recovery, and RTK degradation detection. `deadpool-sqlite` connection pool with WAL mode, periodic PASSIVE checkpoints, and SQLITE_BUSY fail-safe shutdown. Ephemeral bearer token auth with constant-time comparison. mDNS service discovery (`_irontrack._tcp.local.`). Mock telemetry mode for hardware-free testing. 15 integration tests covering the full daemon lifecycle.
 
 ## System Layers
 
 | Layer | Technology | Status |
 |-------|-----------|--------|
-| Core Engine | Rust (synchronous, `rayon`) | v0.3.1 — active development |
-| Network Daemon | Axum/Tokio, REST + WebSocket | Scaffolded — target v0.4 |
+| Core Engine | Rust (synchronous, `rayon`) | v0.4.0 — stable |
+| Network Daemon | Axum/Tokio, REST + WebSocket | v0.4.0 — complete |
 | Trigger Controller | Embedded Rust `no_std` (STM32/RP2040) | Target v0.8 |
 | Glass Cockpit | Tauri 2.0 (Rust + WebView, Canvas 2D) | Target v0.6 |
 | Planning Web UI | React + MapLibre GL JS | Target v0.7 |
