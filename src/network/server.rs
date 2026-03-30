@@ -39,7 +39,7 @@ use tower_http::cors::CorsLayer;
 use crate::dem::TerrainEngine;
 use crate::gpkg::GeoPackage;
 use crate::network::errors::ServerError;
-use crate::network::telemetry::{CurrentState, LineStatus, SystemStatus, TriggerEvent};
+use crate::network::telemetry::{CurrentState, LineStatus, ServerMsg, SystemStatus, TriggerEvent};
 use crate::photogrammetry::FlightPlan;
 use crate::types::{AltitudeDatum, FlightLine};
 
@@ -70,6 +70,7 @@ pub struct FmsState {
     // Telemetry Channels
     pub tx_telemetry: broadcast::Sender<CurrentState>,
     pub tx_status: watch::Sender<SystemStatus>,
+    pub tx_trigger: broadcast::Sender<TriggerEvent>,
 
     // Latest values
     pub last_telemetry: CurrentState,
@@ -89,12 +90,14 @@ impl FmsState {
     pub fn new() -> anyhow::Result<Self> {
         let (tx_telemetry, _) = broadcast::channel(256);
         let (tx_status, _) = watch::channel(SystemStatus::default());
+        let (tx_trigger, _) = broadcast::channel(256);
 
         Ok(Self {
             flight_plan: None,
             terrain_engine: Arc::new(TerrainEngine::new()?),
             tx_telemetry,
             tx_status,
+            tx_trigger,
             last_telemetry: CurrentState::default(),
             last_status: SystemStatus::default(),
             persistence_path: None,
@@ -103,6 +106,20 @@ impl FmsState {
             trigger_log: VecDeque::new(),
             db_pool: None,
         })
+    }
+
+    /// Record a sensor trigger event.
+    ///
+    /// Appends to the bounded in-memory ring buffer (10 000 max, oldest
+    /// dropped), updates the trigger count in `last_status`, and broadcasts
+    /// the event to all WebSocket clients.
+    pub fn record_trigger(&mut self, event: TriggerEvent) {
+        if self.trigger_log.len() >= 10_000 {
+            self.trigger_log.pop_front();
+        }
+        self.trigger_log.push_back(event.clone());
+        self.last_status.trigger_count = self.trigger_log.len() as u32;
+        let _ = self.tx_trigger.send(event);
     }
 }
 
@@ -983,33 +1000,44 @@ async fn ws_handler(
 }
 
 async fn handle_socket(mut socket: WebSocket, state: SharedState) {
-    let initial_status = {
-        let state_guard = state.read().await;
-        let status = state_guard.tx_status.borrow().clone();
-        status
+    // 1. Subscribe to ALL channels BEFORE reading the snapshot.
+    //    This eliminates the race where a state change between
+    //    the snapshot read and the subscription is silently lost.
+    let (mut rx_telemetry, mut rx_status, mut rx_trigger) = {
+        let guard = state.read().await;
+        (
+            guard.tx_telemetry.subscribe(),
+            guard.tx_status.subscribe(),
+            guard.tx_trigger.subscribe(),
+        )
     };
 
-    if let Ok(msg) = serde_json::to_string(&initial_status) {
-        if socket.send(Message::Text(msg)).await.is_err() {
+    // 2. Read the watch snapshot and send as the initialization frame.
+    //    Any changes after this point are captured by the subscriptions.
+    let init = {
+        let guard = state.read().await;
+        let snapshot = guard.tx_status.borrow().clone();
+        snapshot
+    };
+
+    if let Ok(json) = serde_json::to_string(&ServerMsg::Init(init)) {
+        if socket.send(Message::Text(json)).await.is_err() {
             return;
         }
     }
 
-    let (mut rx_telemetry, mut rx_status) = {
-        let state_guard = state.read().await;
-        (
-            state_guard.tx_telemetry.subscribe(),
-            state_guard.tx_status.subscribe(),
-        )
-    };
+    // 3. Ping interval to detect stale clients (WiFi drop, tablet sleep).
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
             result = rx_telemetry.recv() => {
                 match result {
                     Ok(telemetry) => {
-                        if let Ok(msg) = serde_json::to_string(&telemetry) {
-                            if socket.send(Message::Text(msg)).await.is_err() {
+                        if let Ok(json) = serde_json::to_string(
+                            &ServerMsg::Telemetry(telemetry),
+                        ) {
+                            if socket.send(Message::Text(json)).await.is_err() {
                                 break;
                             }
                         }
@@ -1021,10 +1049,27 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
             result = rx_status.changed() => {
                 if result.is_err() { break; }
                 let status = rx_status.borrow().clone();
-                if let Ok(msg) = serde_json::to_string(&status) {
-                    if socket.send(Message::Text(msg)).await.is_err() {
+                if let Ok(json) = serde_json::to_string(
+                    &ServerMsg::Status(status),
+                ) {
+                    if socket.send(Message::Text(json)).await.is_err() {
                         break;
                     }
+                }
+            }
+            result = rx_trigger.recv() => {
+                match result {
+                    Ok(event) => {
+                        if let Ok(json) = serde_json::to_string(
+                            &ServerMsg::Trigger(event),
+                        ) {
+                            if socket.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
             msg = socket.recv() => {
@@ -1034,6 +1079,11 @@ async fn handle_socket(mut socket: WebSocket, state: SharedState) {
                     }
                     Some(Ok(_)) => continue,
                     _ => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(vec![])).await.is_err() {
+                    break;
                 }
             }
         }
@@ -1143,11 +1193,44 @@ pub async fn run_persistence_task(state: SharedState) {
     }
 }
 
+/// Compute heading between two waypoints using the geodesic inverse.
+///
+/// Pure sync function — called via `spawn_blocking` to satisfy audit rule 6
+/// (no geodesic math on the Tokio executor).
+fn compute_mock_heading(
+    lat: f64,
+    lon: f64,
+    next: Option<(f64, f64)>,
+    prev: Option<(f64, f64)>,
+) -> f64 {
+    let geod = geographiclib_rs::Geodesic::wgs84();
+    let azi = if let Some((lat2, lon2)) = next {
+        let (_dist, azi1, _azi2) =
+            geographiclib_rs::InverseGeodesic::inverse(&geod, lat, lon, lat2, lon2);
+        azi1
+    } else if let Some((lat1, lon1)) = prev {
+        let (_dist, azi1, _azi2) =
+            geographiclib_rs::InverseGeodesic::inverse(&geod, lat1, lon1, lat, lon);
+        azi1
+    } else {
+        0.0
+    };
+    // Normalize to [0, 360)
+    ((azi % 360.0) + 360.0) % 360.0
+}
+
 /// Simulate GNSS telemetry by walking through the flight plan waypoints.
+///
+/// At each 100 ms tick the mock aircraft advances one waypoint, computing
+/// a realistic heading via the geodesic inverse problem, updating line
+/// progress in the `watch` channel, and emitting a `TriggerEvent` for
+/// each waypoint visited.
 pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    let mut line_idx = 0;
-    let mut waypoint_idx = 0;
+    let mut line_idx: usize = 0;
+    let mut waypoint_idx: usize = 0;
+    let mut prev_line_idx: Option<usize> = None;
+    let start = std::time::Instant::now();
 
     loop {
         interval.tick().await;
@@ -1177,22 +1260,79 @@ pub async fn run_mock_telemetry(state: SharedState, speed_ms: f64) {
             let lon = line.lons()[waypoint_idx].to_degrees();
             let alt = line.elevations()[waypoint_idx];
 
+            // Compute heading via geodesic inverse on the blocking pool
+            // to keep geodesic math off the Tokio executor [audit rule 6].
+            let next = if waypoint_idx + 1 < line.len() {
+                Some((
+                    line.lats()[waypoint_idx + 1].to_degrees(),
+                    line.lons()[waypoint_idx + 1].to_degrees(),
+                ))
+            } else {
+                None
+            };
+            let prev = if waypoint_idx > 0 {
+                Some((
+                    line.lats()[waypoint_idx - 1].to_degrees(),
+                    line.lons()[waypoint_idx - 1].to_degrees(),
+                ))
+            } else {
+                None
+            };
+            let heading =
+                tokio::task::spawn_blocking(move || compute_mock_heading(lat, lon, next, prev))
+                    .await
+                    .unwrap_or(0.0);
+
             let telemetry = CurrentState {
                 lat,
                 lon,
                 alt,
                 alt_datum: line.altitude_datum,
                 ground_speed_ms: speed_ms,
-                true_heading_deg: 0.0,
+                true_heading_deg: heading,
                 fix_quality: 4,
             };
 
+            let trigger = TriggerEvent {
+                timestamp_ms: start.elapsed().as_millis() as u64,
+                line_index: line_idx,
+                waypoint_index: waypoint_idx,
+                lat,
+                lon,
+                alt,
+            };
+
             {
-                let mut state_guard = state.write().await;
-                state_guard.last_telemetry = telemetry.clone();
-                let _ = state_guard.tx_telemetry.send(telemetry);
+                let mut guard = state.write().await;
+                guard.last_telemetry = telemetry.clone();
+                let _ = guard.tx_telemetry.send(telemetry);
+
+                // Record trigger event
+                guard.record_trigger(trigger);
+
+                // Update line progress in the watch channel
+                if let Some(prev) = prev_line_idx {
+                    if prev != line_idx {
+                        if let Some(s) = guard.last_status.line_statuses.get_mut(prev) {
+                            s.is_active = false;
+                            s.completion_pct = 100.0;
+                        }
+                    }
+                }
+                if let Some(s) = guard.last_status.line_statuses.get_mut(line_idx) {
+                    s.is_active = true;
+                    s.completion_pct = if line.len() > 1 {
+                        waypoint_idx as f64 / (line.len() - 1) as f64 * 100.0
+                    } else {
+                        100.0
+                    };
+                }
+                guard.last_status.active_line_index = Some(line_idx);
+                let status_clone = guard.last_status.clone();
+                let _ = guard.tx_status.send(status_clone);
             }
 
+            prev_line_idx = Some(line_idx);
             waypoint_idx += 1;
         }
     }
@@ -1501,6 +1641,56 @@ fn generate_corridor_plan_internal(
     }
 
     Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// Test server
+// ---------------------------------------------------------------------------
+
+/// Start a lightweight server on a random OS-assigned port.
+///
+/// Returns the bound address and a `JoinHandle` for the server task.
+/// Skips mDNS registration, persistence, and graceful-shutdown signal
+/// handling — designed for self-contained integration tests.
+///
+/// If `mock_speed` is `Some(speed)`, spawns the mock telemetry task.
+pub async fn start_test_server(
+    app: AppState,
+    mock_speed: Option<f64>,
+) -> anyhow::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    if let Some(speed) = mock_speed {
+        let state_clone = app.fms.clone();
+        tokio::spawn(async move {
+            run_mock_telemetry(state_clone, speed).await;
+        });
+    }
+
+    let rest = Router::new()
+        .route("/api/v1/missions", post(create_mission))
+        .route("/api/v1/missions/:id", get(get_mission))
+        .route("/api/v1/missions/:id/lines", get(get_lines))
+        .route(
+            "/api/v1/missions/:id/lines/:line_id",
+            put(update_line).delete(delete_line),
+        )
+        .route("/api/v1/missions/:id/export/gpkg", get(export_gpkg))
+        .route("/api/v1/missions/:id/export/qgc", get(export_qgc))
+        .route("/api/v1/missions/:id/export/dji", get(export_dji))
+        .route_layer(middleware::from_fn_with_state(app.clone(), auth_middleware));
+
+    let router = Router::new()
+        .merge(rest)
+        .route("/ws", get(ws_handler))
+        .with_state(app);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+
+    Ok((addr, handle))
 }
 
 // ---------------------------------------------------------------------------

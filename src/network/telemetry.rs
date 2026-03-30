@@ -69,3 +69,25 @@ pub struct TriggerEvent {
     pub lon: f64,
     pub alt: f64,
 }
+
+/// Type-discriminated envelope for all server-to-client WebSocket messages.
+///
+/// Each variant flattens into JSON with a `"type"` field so clients can
+/// deterministically route messages without probing for field presence.
+///
+/// ```json
+/// {"type": "TELEMETRY", "lat": 51.0, "lon": -0.1, ...}
+/// {"type": "INIT", "active_line_index": null, "line_statuses": [], ...}
+/// ```
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ServerMsg {
+    /// Full state snapshot sent as the first frame on every new connection.
+    Init(SystemStatus),
+    /// 10 Hz kinematic telemetry (position, speed, heading, fix quality).
+    Telemetry(CurrentState),
+    /// State change notification (line selection, completion updates).
+    Status(SystemStatus),
+    /// Sensor trigger event (camera/LiDAR firing confirmation).
+    Trigger(TriggerEvent),
+}
