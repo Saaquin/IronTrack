@@ -20,8 +20,13 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Claude recommended there
+# Local AI development artifacts
+.ai/
+
+# Local MCP and RAG data
 .mcp.json
 lancedb/
 models/
+
+# Generated mission files
 mission.gpkg
