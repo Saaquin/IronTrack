@@ -15,17 +15,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-pub mod ai;
-pub mod datum;
-pub mod dem;
-pub mod error;
-pub mod geodesy;
-pub mod gpkg;
-pub mod io;
-pub mod kinematics;
-pub mod legal;
-pub mod math;
-pub mod network;
-pub mod photogrammetry;
-pub mod trajectory;
-pub mod types;
+//! Kinematics subsystem: wind triangle solver, wind-corrected turn radius,
+//! and atmospheric computations for aerial survey flight planning.
+//!
+//! All functions are pure synchronous math — no async, no I/O.
+//! Uses f64 exclusively for all physical quantities.
+//!
+//! Reference documents:
+//!   - Doc 03: Wind Correction Angle (WCA) / crab angle formulation
+//!   - Doc 16: Aerial wind data, meteorological conventions
+//!   - Doc 50: Wind-corrected turn radius (r_safe)
+
+pub mod atmosphere;
+
+pub use atmosphere::{WindResult, WindVector};

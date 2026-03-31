@@ -214,6 +214,17 @@ enum Commands {
         #[arg(long, default_value = "30.0", value_name = "M/S")]
         turn_airspeed: f64,
 
+        // --- Wind (optional) ------------------------------------------------
+        /// Wind speed in m/s. When specified (with --wind-dir), the wind triangle
+        /// solver computes per-segment ground speed and wind correction angles.
+        #[arg(long, value_name = "M/S", requires = "wind_dir")]
+        wind_speed: Option<f64>,
+
+        /// Wind direction in degrees — meteorological convention (direction the
+        /// wind blows FROM, clockwise from true north). Required with --wind-speed.
+        #[arg(long, value_name = "DEG", requires = "wind_speed")]
+        wind_dir: Option<f64>,
+
         // --- Route optimization ---------------------------------------------
         /// Enable TSP route optimization to minimize repositioning distance.
         /// Reorders flight lines using nearest-neighbor + 2-opt heuristic.
@@ -367,6 +378,8 @@ fn main() {
             corridor_passes,
             max_bank_angle,
             turn_airspeed,
+            wind_speed,
+            wind_dir,
             optimize_route,
             launch_lat,
             launch_lon,
@@ -404,6 +417,8 @@ fn main() {
             corridor_passes,
             max_bank_angle,
             turn_airspeed,
+            wind_speed,
+            wind_dir,
             optimize_route,
             launch_lat,
             launch_lon,
@@ -559,6 +574,8 @@ struct PlanArgs {
     corridor_passes: Option<u8>,
     max_bank_angle: f64,
     turn_airspeed: f64,
+    wind_speed: Option<f64>,
+    wind_dir: Option<f64>,
     optimize_route: bool,
     launch_lat: Option<f64>,
     launch_lon: Option<f64>,
@@ -733,7 +750,28 @@ fn run_plan(args: PlanArgs) -> Result<()> {
             params
         };
 
-        let p = generate_flight_lines(&bbox, args.azimuth, &params)
+        // Pre-compute wind-adjusted spacing before line generation so that
+        // sidelap is maintained under forecast crab angle (Phase 7B).
+        let spacing_override = match (args.wind_speed, args.wind_dir) {
+            (Some(speed), Some(dir)) => {
+                let wind = irontrack::kinematics::WindVector::new(speed, dir)
+                    .context("invalid wind parameters")?;
+                let adjusted = params
+                    .wind_adjusted_flight_line_spacing(args.azimuth, args.turn_airspeed, &wind)
+                    .context("wind-adjusted spacing computation failed")?;
+                let nominal = params.flight_line_spacing();
+                println!(
+                    "Wind compensation: spacing {:.1} m → {:.1} m ({:.1}% reduction)",
+                    nominal,
+                    adjusted,
+                    (1.0 - adjusted / nominal) * 100.0
+                );
+                Some(adjusted)
+            }
+            _ => None,
+        };
+
+        let p = generate_flight_lines(&bbox, args.azimuth, &params, spacing_override)
             .context("flight line generation failed")?;
         let pm = p.params.clone();
         (p, pm)
@@ -842,6 +880,37 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         }
         (plan, None)
     };
+
+    // --- Wind triangle computation (optional) --------------------------------
+
+    if let (Some(speed), Some(dir)) = (args.wind_speed, args.wind_dir) {
+        let wind = irontrack::kinematics::WindVector::new(speed, dir)
+            .context("invalid wind parameters")?;
+
+        let turn_params_for_wind = validate_turn_params(args.turn_airspeed, args.max_bank_angle)?;
+        let r_safe = turn_params_for_wind.wind_adjusted_radius(wind.speed_ms);
+        let r_min = turn_params_for_wind.min_radius();
+        println!(
+            "Wind: {:.1} m/s from {:.0}\u{00b0} | r_safe={:.0} m (r_min={:.0} m)",
+            wind.speed_ms, wind.direction_deg, r_safe, r_min
+        );
+
+        irontrack::kinematics::atmosphere::apply_wind_to_plan(&mut plan, args.turn_airspeed, &wind)
+            .context("wind triangle computation failed")?;
+
+        // Summary: average ground speed across survey legs
+        let survey_gs: Vec<f64> = plan
+            .lines
+            .iter()
+            .filter(|l| !l.is_transit)
+            .filter_map(|l| l.ground_speeds())
+            .flat_map(|gs| gs.iter().copied())
+            .collect();
+        if !survey_gs.is_empty() {
+            let avg: f64 = survey_gs.iter().sum::<f64>() / survey_gs.len() as f64;
+            println!("Average ground speed (survey legs): {avg:.1} m/s");
+        }
+    }
 
     // --- DSM safety warning ------------------------------------------------
 
@@ -1344,6 +1413,36 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
         None
     };
 
+    // --- Wind triangle computation (optional) --------------------------------
+
+    if let (Some(speed), Some(dir)) = (args.wind_speed, args.wind_dir) {
+        let wind = irontrack::kinematics::WindVector::new(speed, dir)
+            .context("invalid wind parameters")?;
+
+        let turn_params_for_wind = validate_turn_params(args.turn_airspeed, args.max_bank_angle)?;
+        let r_safe = turn_params_for_wind.wind_adjusted_radius(wind.speed_ms);
+        let r_min = turn_params_for_wind.min_radius();
+        println!(
+            "Wind: {:.1} m/s from {:.0}\u{00b0} | r_safe={:.0} m (r_min={:.0} m)",
+            wind.speed_ms, wind.direction_deg, r_safe, r_min
+        );
+
+        irontrack::kinematics::atmosphere::apply_wind_to_plan(&mut plan, args.turn_airspeed, &wind)
+            .context("wind triangle computation failed")?;
+
+        let survey_gs: Vec<f64> = plan
+            .lines
+            .iter()
+            .filter(|l| !l.is_transit)
+            .filter_map(|l| l.ground_speeds())
+            .flat_map(|gs| gs.iter().copied())
+            .collect();
+        if !survey_gs.is_empty() {
+            let avg: f64 = survey_gs.iter().sum::<f64>() / survey_gs.len() as f64;
+            println!("Average ground speed (survey legs): {avg:.1} m/s");
+        }
+    }
+
     // --- DSM safety warning ------------------------------------------------
 
     let agl_datum_conversion_uses_dem = plan.lines.iter().any(|l| l.altitude_datum != target_datum)
@@ -1833,6 +1932,8 @@ fn nl_params_to_plan_args(p: NlPlanParams, output: PathBuf) -> Result<PlanArgs> 
         corridor_passes: None,
         max_bank_angle: 20.0,
         turn_airspeed: 30.0,
+        wind_speed: None,
+        wind_dir: None,
         optimize_route: false,
         launch_lat: None,
         launch_lon: None,

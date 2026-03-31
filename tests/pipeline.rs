@@ -79,7 +79,7 @@ fn full_pipeline_gpkg_and_geojson_are_created() {
     let gpkg_path = dir.path().join("plan.gpkg");
     let geojson_path = dir.path().join("plan.geojson");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     assert!(
         !plan.lines.is_empty(),
         "plan must have at least one flight line"
@@ -102,7 +102,7 @@ fn gpkg_row_count_matches_plan_line_count() {
     let dir = tempdir().unwrap();
     let gpkg_path = dir.path().join("plan.gpkg");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let n_lines = plan.lines.len();
 
     let gpkg = GeoPackage::new(&gpkg_path).unwrap();
@@ -122,7 +122,7 @@ fn gpkg_rtree_entry_count_matches_plan_line_count() {
     let dir = tempdir().unwrap();
     let gpkg_path = dir.path().join("plan.gpkg");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let n_lines = plan.lines.len();
 
     let gpkg = GeoPackage::new(&gpkg_path).unwrap();
@@ -141,7 +141,7 @@ fn gpkg_can_be_reopened_and_read() {
     let dir = tempdir().unwrap();
     let gpkg_path = dir.path().join("round_trip.gpkg");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let n_lines = plan.lines.len();
 
     {
@@ -165,7 +165,7 @@ fn geojson_feature_count_matches_plan_line_count() {
     let dir = tempdir().unwrap();
     let geojson_path = dir.path().join("plan.geojson");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let n_lines = plan.lines.len();
 
     write_geojson(&geojson_path, &plan, None, None, None).unwrap();
@@ -193,7 +193,7 @@ fn geojson_coordinates_are_lon_lat_order() {
     let dir = tempdir().unwrap();
     let geojson_path = dir.path().join("plan.geojson");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     write_geojson(&geojson_path, &plan, None, None, None).unwrap();
 
     let fc: serde_json::Value =
@@ -220,7 +220,7 @@ fn geojson_coordinates_have_elevation_component() {
     let dir = tempdir().unwrap();
     let geojson_path = dir.path().join("plan.geojson");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     write_geojson(&geojson_path, &plan, None, None, None).unwrap();
 
     let fc: serde_json::Value =
@@ -252,8 +252,8 @@ fn plan_with_east_west_azimuth_produces_correct_lines() {
     let bbox = england_bbox();
     let params = standard_params();
 
-    let plan_ns = generate_flight_lines(&bbox, 0.0, &params).unwrap();
-    let plan_ew = generate_flight_lines(&bbox, 90.0, &params).unwrap();
+    let plan_ns = generate_flight_lines(&bbox, 0.0, &params, None).unwrap();
+    let plan_ew = generate_flight_lines(&bbox, 90.0, &params, None).unwrap();
 
     assert!(plan_ns.lines.len() >= 1);
     assert!(plan_ew.lines.len() >= 1);
@@ -275,7 +275,7 @@ fn gpkg_contents_bbox_is_populated_after_insert() {
     let gpkg_path = dir.path().join("plan.gpkg");
 
     let bbox = england_bbox();
-    let plan = generate_flight_lines(&bbox, 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&bbox, 0.0, &standard_params(), None).unwrap();
 
     let gpkg = GeoPackage::new(&gpkg_path).unwrap();
     gpkg.create_feature_table("flight_lines").unwrap();
@@ -316,7 +316,7 @@ fn qgc_plan_waypoint_count_altitude_and_commands() {
 
     let params = standard_params();
     let trigger_dist = params.photo_interval();
-    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params).unwrap();
+    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params, None).unwrap();
 
     /*
      * QGC export requires WGS84 ellipsoidal or AGL altitudes. Stamp the
@@ -400,7 +400,7 @@ fn dji_kmz_contains_egm96_altitudes_and_valid_structure() {
     let kmz_path = dir.path().join("mission.kmz");
 
     let params = standard_params();
-    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params).unwrap();
+    let base_plan = generate_flight_lines(&england_bbox(), 0.0, &params, None).unwrap();
 
     /*
      * DJI export requires EGM96. Stamp the flat-terrain plan as EGM96 —

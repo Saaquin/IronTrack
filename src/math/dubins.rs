@@ -107,6 +107,21 @@ impl TurnParams {
         let bank_rad = self.max_bank_angle_deg.to_radians();
         self.true_airspeed * bank_rad / max_roll_rate_rad
     }
+
+    /// Wind-corrected turn radius (Doc 50).
+    ///
+    /// Inflates the minimum turn radius to account for worst-case ground
+    /// speed during the downwind arc of a turn. The formula uses the maximum
+    /// possible ground speed (TAS + wind) at maximum bank angle.
+    ///
+    /// `r_safe = (V_TAS + V_wind)^2 / (g * tan(phi_max))`
+    ///
+    /// Returns the same radius as `min_radius()` when `wind_speed_ms` is zero.
+    pub fn wind_adjusted_radius(&self, wind_speed_ms: f64) -> f64 {
+        let bank_rad = self.max_bank_angle_deg.to_radians();
+        let v_max = self.true_airspeed + wind_speed_ms.abs();
+        v_max * v_max / (G * bank_rad.tan())
+    }
 }
 
 /// An oriented 2D waypoint: position + heading.
@@ -700,6 +715,25 @@ mod tests {
     use super::*;
 
     /// R_min = V^2 / (g * tan(bank)).
+    #[test]
+    fn wind_adjusted_radius_zero_wind_equals_min_radius() {
+        let tp = TurnParams::new(30.0, 20.0);
+        assert_abs_diff_eq!(
+            tp.wind_adjusted_radius(0.0),
+            tp.min_radius(),
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn wind_adjusted_radius_increases_with_wind() {
+        let tp = TurnParams::new(30.0, 20.0);
+        let r_safe = tp.wind_adjusted_radius(10.0);
+        let expected = (30.0 + 10.0_f64).powi(2) / (G * 20.0_f64.to_radians().tan());
+        assert_abs_diff_eq!(r_safe, expected, epsilon = 1e-6);
+        assert!(r_safe > tp.min_radius());
+    }
+
     /// At 30 m/s, 20 deg bank: R = 900 / (9.80665 * 0.364) = ~252 m.
     #[test]
     fn turn_radius_physics() {

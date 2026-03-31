@@ -138,6 +138,23 @@ impl SensorParams {
         2.0 * agl_m * (self.fov_vertical() / 2.0).tan()
     }
 
+    /// Effective cross-track swath width under a crab (yaw) angle.
+    ///
+    /// When the aircraft crabs into the wind, the sensor footprint rotates
+    /// relative to the ground track, reducing the contiguous coverage strip
+    /// perpendicular to the flight line:
+    ///
+    ///   W_eff = W_s × cos(|WCA|) − H_f × sin(|WCA|)
+    ///
+    /// Clamped to 0.0 when the crab angle is too extreme for any usable
+    /// coverage. \[Doc 21 §2.3, Doc 03 §Geometric Impact\]
+    pub fn effective_swath_width(&self, agl_m: f64, wca_rad: f64) -> f64 {
+        let w = self.swath_width(agl_m);
+        let h = self.swath_height(agl_m);
+        let abs_wca = wca_rad.abs();
+        (w * abs_wca.cos() - h * abs_wca.sin()).max(0.0)
+    }
+
     /// AGL required to achieve a target worst-case GSD, in metres.
     ///
     /// Rearranges the worst-case GSD equation. The binding axis is whichever
@@ -369,5 +386,67 @@ mod tests {
             image_height_px: 3648,
         };
         assert_abs_diff_eq!(s.pixel_pitch(), 13.2 / 5472.0_f64, epsilon = 1e-15);
+    }
+
+    // -- effective_swath_width (Phase 7B) --
+
+    #[test]
+    fn effective_swath_zero_crab_equals_nominal() {
+        let s = ixm100();
+        let agl = 1000.0;
+        assert_abs_diff_eq!(
+            s.effective_swath_width(agl, 0.0),
+            s.swath_width(agl),
+            epsilon = 1e-10,
+        );
+    }
+
+    #[test]
+    fn effective_swath_90_deg_crab_is_zero() {
+        let s = ixm100();
+        // At 90° crab the footprint is perpendicular — no contiguous coverage.
+        assert_abs_diff_eq!(
+            s.effective_swath_width(1000.0, std::f64::consts::FRAC_PI_2),
+            0.0,
+            epsilon = 1e-10,
+        );
+    }
+
+    #[test]
+    fn effective_swath_symmetric_in_crab_angle() {
+        let s = ixm100();
+        let agl = 1000.0;
+        let theta = 0.15; // ~8.6 degrees
+        assert_abs_diff_eq!(
+            s.effective_swath_width(agl, theta),
+            s.effective_swath_width(agl, -theta),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn effective_swath_known_value_5deg() {
+        // iXM-100 at 1000 m: W=1068.0, H=800.0
+        // WCA = 5° = 0.08726646 rad
+        // W_eff = 1068 * cos(5°) - 800 * sin(5°)
+        //       = 1068 * 0.99619 - 800 * 0.08716
+        //       = 1063.93 - 69.73
+        //       ≈ 994.20
+        let s = ixm100();
+        let wca_rad = 5.0_f64.to_radians();
+        let w_eff = s.effective_swath_width(1000.0, wca_rad);
+        let expected = 1068.0 * wca_rad.cos() - 800.0 * wca_rad.sin();
+        assert_abs_diff_eq!(w_eff, expected, epsilon = 0.01);
+        assert!(w_eff < s.swath_width(1000.0));
+        assert!(w_eff > 0.0);
+    }
+
+    #[test]
+    fn effective_swath_clamped_at_zero() {
+        // Extreme crab angle where formula goes negative → clamped to 0.
+        let s = ixm100();
+        // At 60° crab: 1068*cos60 - 800*sin60 = 534 - 692.8 = -158.8 → 0
+        let w_eff = s.effective_swath_width(1000.0, 60.0_f64.to_radians());
+        assert_abs_diff_eq!(w_eff, 0.0, epsilon = 1e-10);
     }
 }

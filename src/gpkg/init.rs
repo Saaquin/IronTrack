@@ -39,7 +39,7 @@ use crate::types::AltitudeDatum;
 /// Increment this whenever a breaking change is made to the GeoPackage schema
 /// (new mandatory column, changed geometry type, renamed table, etc.).
 /// v0.1 files predate this table and are treated as schema_version = 1.
-const CURRENT_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 use super::binary;
 use super::rtree;
@@ -361,6 +361,40 @@ impl GeoPackage {
             )));
         }
 
+        // --- Forward migrations -------------------------------------------------
+
+        if file_version <= 2 {
+            /*
+             * v2 → v3: add optional crab_angle_deg column to every feature table.
+             * ALTER TABLE ... ADD COLUMN is a no-op if the column already exists
+             * in SQLite, but we guard with PRAGMA table_info to be safe.
+             */
+            let tables: Vec<String> = self
+                .conn
+                .prepare("SELECT table_name FROM gpkg_contents WHERE data_type='features'")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for tbl in &tables {
+                // Check if column already exists (idempotent migration).
+                let has_col: bool = self
+                    .conn
+                    .prepare(&format!("PRAGMA table_info({tbl})"))?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .any(|name| name.as_deref() == Ok("crab_angle_deg"));
+                if !has_col {
+                    self.conn.execute_batch(&format!(
+                        "ALTER TABLE {tbl} ADD COLUMN crab_angle_deg REAL DEFAULT NULL;"
+                    ))?;
+                }
+            }
+
+            self.conn.execute(
+                "UPDATE irontrack_metadata SET value=?1 WHERE key='schema_version'",
+                params![CURRENT_SCHEMA_VERSION.to_string()],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -384,6 +418,7 @@ impl GeoPackage {
                 line_index     INTEGER NOT NULL,
                 altitude_datum TEXT    NOT NULL DEFAULT 'EGM2008',
                 completion_pct REAL    NOT NULL DEFAULT 0.0,
+                crab_angle_deg REAL    DEFAULT NULL,
                 geom           BLOB    NOT NULL
             );
             "#
@@ -435,7 +470,8 @@ impl GeoPackage {
 
         let result = (|| {
             let mut stmt = self.conn.prepare(&format!(
-                "INSERT INTO {table_name} (line_index, altitude_datum, geom) VALUES (?1, ?2, ?3)"
+                "INSERT INTO {table_name} (line_index, altitude_datum, crab_angle_deg, geom) \
+                 VALUES (?1, ?2, ?3, ?4)"
             ))?;
 
             for (idx, line) in plan.lines.iter().enumerate() {
@@ -451,7 +487,13 @@ impl GeoPackage {
                     .map(|((lon, lat), &elev)| (lon, lat, elev))
                     .collect();
                 let blob = binary::encode_linestring_z(&coords, 4326);
-                stmt.execute(params![idx as i64, line.altitude_datum.as_str(), blob])?;
+                let crab: Option<f64> = line.representative_crab_angle();
+                stmt.execute(params![
+                    idx as i64,
+                    line.altitude_datum.as_str(),
+                    crab,
+                    blob
+                ])?;
             }
 
             /*

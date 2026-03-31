@@ -38,7 +38,7 @@ use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic};
 use rayon::prelude::*;
 
 use crate::dem::TerrainEngine;
-use crate::error::{DemError, PhotogrammetryError};
+use crate::error::{DemError, KinematicsError, PhotogrammetryError};
 use crate::math::dubins::TurnParams;
 use crate::math::numerics::KahanAccumulator;
 use crate::photogrammetry::lidar::{self, LidarSensorParams};
@@ -192,6 +192,32 @@ impl FlightPlanParams {
     /// B = swath_height × (1 − end_lap / 100)  [formula_reference.md §4]
     pub fn photo_interval(&self) -> f64 {
         self.sensor.swath_height(self.nominal_agl()) * (1.0 - self.end_lap_percent / 100.0)
+    }
+
+    /// Cross-track spacing adjusted for wind-induced crab angle.
+    ///
+    /// Uses the conservative inscribed-strip formula (Doc 21 §2.3) to reduce
+    /// spacing so sidelap is maintained when the sensor footprint is rotated
+    /// by the wind correction angle. Boustrophedon symmetry means |WCA| is
+    /// the same for T and T+180°, so one computation per grid azimuth suffices.
+    ///
+    /// Returns `Err` if TAS is insufficient or W_eff ≤ 0 (infeasible wind).
+    pub fn wind_adjusted_flight_line_spacing(
+        &self,
+        track_deg: f64,
+        tas_ms: f64,
+        wind: &crate::kinematics::atmosphere::WindVector,
+    ) -> Result<f64, KinematicsError> {
+        let result = crate::kinematics::atmosphere::solve_wind_triangle(track_deg, tas_ms, wind)?;
+        let agl = self.nominal_agl();
+        let wca_rad = result.wca_deg.to_radians();
+        let w_eff = self.sensor.effective_swath_width(agl, wca_rad);
+        if w_eff <= 0.0 {
+            return Err(KinematicsError::InfeasibleWind {
+                wca_deg: result.wca_deg,
+            });
+        }
+        Ok(w_eff * (1.0 - self.side_lap_percent / 100.0))
     }
 }
 
@@ -360,8 +386,9 @@ pub fn generate_flight_lines(
     bbox: &BoundingBox,
     azimuth_deg: f64,
     params: &FlightPlanParams,
+    spacing_override: Option<f64>,
 ) -> Result<FlightPlan, PhotogrammetryError> {
-    let spacing = params.flight_line_spacing();
+    let spacing = spacing_override.unwrap_or_else(|| params.flight_line_spacing());
     let photo_interval = params.photo_interval();
 
     if !spacing.is_finite() || spacing <= 0.0 {
@@ -1482,7 +1509,7 @@ mod tests {
          * n_lines = ⌈1113/191.52⌉ + 1 = 6 + 1 = 7
          */
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         assert_eq!(plan.lines.len(), 7, "expected 7 flight lines");
     }
 
@@ -1493,7 +1520,7 @@ mod tests {
          * n_waypoints = ⌈1111/72.96⌉ + 1 = 16 + 1 = 17
          */
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         for (i, line) in plan.lines.iter().enumerate() {
             assert_eq!(
                 line.len(),
@@ -1508,7 +1535,7 @@ mod tests {
     fn waypoints_go_north_for_azimuth_zero() {
         // For azimuth 0° (north), successive waypoints must have increasing latitude.
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         let lats = plan.lines[0].lats();
         assert!(
             lats.last().unwrap() > lats.first().unwrap(),
@@ -1526,7 +1553,7 @@ mod tests {
          */
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let spacing = p.flight_line_spacing();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         let geod = Geodesic::wgs84();
 
         for pair in plan.lines.windows(2) {
@@ -1548,7 +1575,7 @@ mod tests {
         // interval of the southern bbox edge (within ~75 m for this sensor).
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let interval = p.photo_interval();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         for line in &plan.lines {
             let south_lat = line.lats()[0].to_degrees();
             assert!(
@@ -1567,7 +1594,7 @@ mod tests {
          * n_lines = ⌈1111/191.52⌉ + 1 = 6 + 1 = 7 (within ±1 of N-S case)
          */
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 90.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 90.0, &p, None).unwrap();
         // At equator lat=lon span is nearly equal, so expect the same count.
         assert!(
             plan.lines.len() >= 6 && plan.lines.len() <= 8,
@@ -1585,7 +1612,7 @@ mod tests {
             max_lat: 49.0,
             max_lon: -122.0,
         };
-        assert!(generate_flight_lines(&degenerate, 0.0, &p).is_err());
+        assert!(generate_flight_lines(&degenerate, 0.0, &p, None).is_err());
     }
 
     #[test]
@@ -1597,7 +1624,7 @@ mod tests {
             max_lat: 0.0,
             max_lon: 0.0,
         };
-        assert!(generate_flight_lines(&inverted, 0.0, &p).is_err());
+        assert!(generate_flight_lines(&inverted, 0.0, &p, None).is_err());
     }
 
     #[test]
@@ -1610,7 +1637,7 @@ mod tests {
             max_lat: 91.0,
             max_lon: 1.0,
         };
-        assert!(generate_flight_lines(&oob_lat, 0.0, &p).is_err());
+        assert!(generate_flight_lines(&oob_lat, 0.0, &p, None).is_err());
         // Longitude > 180
         let oob_lon = BoundingBox {
             min_lat: 0.0,
@@ -1618,14 +1645,14 @@ mod tests {
             max_lat: 1.0,
             max_lon: 181.0,
         };
-        assert!(generate_flight_lines(&oob_lon, 0.0, &p).is_err());
+        assert!(generate_flight_lines(&oob_lon, 0.0, &p, None).is_err());
     }
 
     #[test]
     fn non_finite_azimuth_is_error() {
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        assert!(generate_flight_lines(&equator_bbox(), f64::NAN, &p).is_err());
-        assert!(generate_flight_lines(&equator_bbox(), f64::INFINITY, &p).is_err());
+        assert!(generate_flight_lines(&equator_bbox(), f64::NAN, &p, None).is_err());
+        assert!(generate_flight_lines(&equator_bbox(), f64::INFINITY, &p, None).is_err());
     }
 
     // --- FlightPlan struct tests (Milestone 2D) ------------------------------
@@ -1634,7 +1661,7 @@ mod tests {
     fn flight_plan_preserves_azimuth() {
         // The azimuth stored in the returned FlightPlan must match what was passed in.
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 45.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 45.0, &p, None).unwrap();
         assert_abs_diff_eq!(plan.azimuth_deg, 45.0, epsilon = 1e-12);
     }
 
@@ -1644,7 +1671,7 @@ mod tests {
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let target = p.target_gsd_m;
         let side = p.side_lap_percent;
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         assert_abs_diff_eq!(plan.params.target_gsd_m, target, epsilon = 1e-15);
         assert_abs_diff_eq!(plan.params.side_lap_percent, side, epsilon = 1e-15);
     }
@@ -1660,7 +1687,7 @@ mod tests {
          * the returned pair must be (lon, lat), not (lat, lon).
          */
         let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
         let line = &plan.lines[0];
 
         // Verify the iterator length matches the waypoint count.
@@ -1808,7 +1835,7 @@ mod tests {
          */
         let (_dir, engine) = flat_terrain_engine(0.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let reports = validate_overlap(&plan, &engine).unwrap();
 
         assert_eq!(
@@ -1837,7 +1864,7 @@ mod tests {
         let (_dir, engine) = flat_terrain_engine(100.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let nominal_agl = params.nominal_agl();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let reports = validate_overlap(&plan, &engine).unwrap();
 
         assert!(
@@ -1860,7 +1887,7 @@ mod tests {
         let (_dir, engine) = flat_terrain_engine(0.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let nominal_agl = params.nominal_agl();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let adjusted = adjust_for_terrain(&plan, &engine).unwrap();
 
         for line in &adjusted.lines {
@@ -1881,7 +1908,7 @@ mod tests {
         let (_dir, engine) = flat_terrain_engine(200.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
         let nominal_agl = params.nominal_agl();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let adjusted = adjust_for_terrain(&plan, &engine).unwrap();
 
         let expected = 200.0_f64 + nominal_agl;
@@ -1896,7 +1923,7 @@ mod tests {
     fn adjust_for_terrain_preserves_line_and_waypoint_count() {
         let (_dir, engine) = flat_terrain_engine(50.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let adjusted = adjust_for_terrain(&plan, &engine).unwrap();
 
         assert_eq!(
@@ -1921,7 +1948,7 @@ mod tests {
          */
         let (_dir, engine) = flat_terrain_engine(50.0);
         let params = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
-        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&equator_bbox(), 0.0, &params, None).unwrap();
         let adjusted = adjust_for_terrain(&plan, &engine).unwrap();
 
         for (orig, adj) in plan.lines.iter().zip(adjusted.lines.iter()) {
@@ -2067,7 +2094,7 @@ mod tests {
             .unwrap()
             .with_end_lap(80.0)
             .unwrap();
-        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params, None).unwrap();
         let original_lines = plan.lines.len();
 
         let poly = Polygon::new(vec![
@@ -2103,7 +2130,7 @@ mod tests {
             .unwrap()
             .with_end_lap(80.0)
             .unwrap();
-        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params, None).unwrap();
         let original_lines = plan.lines.len();
 
         let poly = Polygon::new(vec![
@@ -2152,7 +2179,7 @@ mod tests {
             .unwrap()
             .with_end_lap(80.0)
             .unwrap();
-        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params, None).unwrap();
 
         let outer = vec![
             (51.49, -0.11),
@@ -2209,7 +2236,7 @@ mod tests {
             .unwrap()
             .with_end_lap(80.0)
             .unwrap();
-        let _plan = generate_flight_lines(&bbox, 90.0, &params).unwrap();
+        let _plan = generate_flight_lines(&bbox, 90.0, &params, None).unwrap();
 
         /*
          * Polygon covers the southern half: lat in [51.49, 51.505].
@@ -2223,7 +2250,7 @@ mod tests {
          * runs N to S, crossing lat=51.505. Clip to a polygon whose
          * NORTH edge is at 51.505.
          */
-        let plan = generate_flight_lines(&bbox, 0.0, &params).unwrap();
+        let plan = generate_flight_lines(&bbox, 0.0, &params, None).unwrap();
 
         let poly = Polygon::new(vec![
             (51.499, -0.11),
@@ -2253,5 +2280,60 @@ mod tests {
             "bisection should produce a waypoint within ~10 m of the polygon boundary \
              (closest: {closest_to_boundary:.7}°)"
         );
+    }
+
+    // -- wind_adjusted_flight_line_spacing (Phase 7B) --
+
+    #[test]
+    fn wind_adjusted_spacing_calm_equals_nominal() {
+        let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
+        let calm = crate::kinematics::atmosphere::WindVector::new(0.0, 0.0).unwrap();
+        let adjusted = p
+            .wind_adjusted_flight_line_spacing(0.0, 50.0, &calm)
+            .unwrap();
+        let nominal = p.flight_line_spacing();
+        approx::assert_abs_diff_eq!(adjusted, nominal, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn wind_adjusted_spacing_crosswind_is_smaller() {
+        let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
+        let wind = crate::kinematics::atmosphere::WindVector::new(10.0, 90.0).unwrap();
+        let adjusted = p
+            .wind_adjusted_flight_line_spacing(0.0, 50.0, &wind)
+            .unwrap();
+        let nominal = p.flight_line_spacing();
+        assert!(
+            adjusted < nominal,
+            "wind-adjusted spacing {adjusted:.1} should be less than nominal {nominal:.1}"
+        );
+    }
+
+    #[test]
+    fn wind_adjusted_spacing_generates_more_lines() {
+        let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
+        let wind = crate::kinematics::atmosphere::WindVector::new(10.0, 90.0).unwrap();
+        let adjusted = p
+            .wind_adjusted_flight_line_spacing(0.0, 50.0, &wind)
+            .unwrap();
+
+        let plan_no_wind = generate_flight_lines(&equator_bbox(), 0.0, &p, None).unwrap();
+        let plan_wind = generate_flight_lines(&equator_bbox(), 0.0, &p, Some(adjusted)).unwrap();
+
+        assert!(
+            plan_wind.lines.len() >= plan_no_wind.lines.len(),
+            "wind-compensated plan should have at least as many lines: {} vs {}",
+            plan_wind.lines.len(),
+            plan_no_wind.lines.len()
+        );
+    }
+
+    #[test]
+    fn infeasible_wind_returns_error() {
+        let p = FlightPlanParams::new(phantom4pro(), 0.05).unwrap();
+        // Crosswind at TAS — nearly impossible to fly, W_eff should be zero
+        let wind = crate::kinematics::atmosphere::WindVector::new(49.0, 90.0).unwrap();
+        let result = p.wind_adjusted_flight_line_spacing(0.0, 50.0, &wind);
+        assert!(result.is_err(), "extreme crosswind should return an error");
     }
 }

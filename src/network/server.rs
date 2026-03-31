@@ -515,6 +515,12 @@ pub struct LoadMissionRequest {
     pub terrain: bool,
     #[serde(default = "default_datum")]
     pub datum: String,
+
+    // Wind (optional)
+    /// Wind speed in m/s (meteorological surface wind).
+    pub wind_speed_ms: Option<f64>,
+    /// Wind direction in degrees — meteorological FROM convention, clockwise from north.
+    pub wind_direction_deg: Option<f64>,
 }
 
 fn default_sensor() -> String {
@@ -1530,7 +1536,27 @@ fn generate_plan_internal(
             .with_side_lap(req.side_lap)?
             .with_end_lap(req.end_lap)?;
         params.flight_altitude_msl = req.altitude_msl;
-        generate_flight_lines(&bbox, req.azimuth, &params)?
+
+        // Pre-compute wind-adjusted spacing before line generation (Phase 7B).
+        let spacing_override = match (req.wind_speed_ms, req.wind_direction_deg) {
+            (Some(speed), Some(dir)) => {
+                let wind = crate::kinematics::WindVector::new(speed, dir)?;
+                let adjusted = params.wind_adjusted_flight_line_spacing(
+                    req.azimuth,
+                    req.turn_airspeed,
+                    &wind,
+                )?;
+                log::info!(
+                    "Wind compensation: spacing {:.1} m → {:.1} m",
+                    params.flight_line_spacing(),
+                    adjusted
+                );
+                Some(adjusted)
+            }
+            _ => None,
+        };
+
+        generate_flight_lines(&bbox, req.azimuth, &params, spacing_override)?
     };
 
     if let Some(ref polys) = boundary_polygons {
@@ -1597,6 +1623,18 @@ fn generate_plan_internal(
             converted.push(line.to_datum(target_datum, terrain_engine)?);
         }
         plan.lines = converted;
+    }
+
+    // Wind triangle: compute per-segment ground speeds
+    match (req.wind_speed_ms, req.wind_direction_deg) {
+        (Some(speed), Some(dir)) => {
+            let wind = crate::kinematics::WindVector::new(speed, dir)?;
+            crate::kinematics::atmosphere::apply_wind_to_plan(&mut plan, req.turn_airspeed, &wind)?;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("both wind_speed_ms and wind_direction_deg must be provided together");
+        }
+        (None, None) => {}
     }
 
     Ok(plan)
@@ -1710,6 +1748,18 @@ fn generate_corridor_plan_internal(
             converted.push(line.to_datum(target_datum, terrain_engine)?);
         }
         plan.lines = converted;
+    }
+
+    // Wind triangle: compute per-segment ground speeds
+    match (req.wind_speed_ms, req.wind_direction_deg) {
+        (Some(speed), Some(dir)) => {
+            let wind = crate::kinematics::WindVector::new(speed, dir)?;
+            crate::kinematics::atmosphere::apply_wind_to_plan(&mut plan, req.turn_airspeed, &wind)?;
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("both wind_speed_ms and wind_direction_deg must be provided together");
+        }
+        (None, None) => {}
     }
 
     Ok(plan)
@@ -1836,6 +1886,8 @@ mod tests {
             launch_lon: None,
             terrain: false,
             datum: "egm2008".into(),
+            wind_speed_ms: None,
+            wind_direction_deg: None,
         }
     }
 

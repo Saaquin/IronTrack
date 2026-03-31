@@ -333,10 +333,14 @@ where:
   θ = angle between wind direction and course line
 ```
 
-Effective swath under crab:
+Effective swath under crab (contiguous coverage strip, Doc 21 §2.3):
 ```
-W_eff = W_s × cos(WCA) + H_f × sin(WCA)    (effective lateral coverage)
-H_eff = H_f × cos(WCA) + W_s × sin(WCA)    (effective forward coverage)
+W_eff = W_s × cos(|WCA|) − H_f × sin(|WCA|)   (clamped ≥ 0)
+H_eff = H_f × cos(|WCA|) − W_s × sin(|WCA|)   (clamped ≥ 0)
+
+Note: the bounding-box projection (W_s×cos + H_f×sin) gives the total
+rotated extent, NOT the contiguous coverage strip. Use the MINUS formula
+for flight line spacing to guarantee gap-free sidelap coverage.
 ```
 
 ### Linear Motion Blur (Pixel Smear)

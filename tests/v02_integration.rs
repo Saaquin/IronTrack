@@ -79,7 +79,7 @@ fn full_pipeline_all_exports() {
     let qgc_path = dir.path().join("plan.plan");
     let dji_path = dir.path().join("plan.kmz");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     assert!(!plan.lines.is_empty());
 
     // --- GeoPackage --------------------------------------------------------
@@ -89,13 +89,13 @@ fn full_pipeline_all_exports() {
     gpkg.insert_flight_plan("flight_lines", &plan).unwrap();
 
     /*
-     * Verify irontrack_metadata table exists with schema_version=2.
+     * Verify irontrack_metadata table exists with current schema version.
      */
     let schema_ver: String = gpkg
         .query_metadata("schema_version")
         .unwrap()
         .expect("schema_version must exist");
-    assert_eq!(schema_ver, "2");
+    assert_eq!(schema_ver, "3");
 
     // --- GeoJSON -----------------------------------------------------------
 
@@ -276,7 +276,7 @@ fn kml_boundary_import_and_polygon_clipping() {
     let polygons = parse_boundary(&kml_path).unwrap();
     assert_eq!(polygons.len(), 1);
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let clipped = clip_to_polygon(plan, &polygons[0]);
 
     assert!(!clipped.lines.is_empty(), "some lines should survive");
@@ -313,7 +313,7 @@ fn concave_polygon_clipping_removes_correct_region() {
         (51.511, -0.101),
     ]);
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let original_total: usize = plan.lines.iter().map(|l| l.len()).sum();
     let clipped = clip_to_polygon(plan, &poly);
     let clipped_total: usize = clipped.lines.iter().map(|l| l.len()).sum();
@@ -355,7 +355,7 @@ fn polygon_with_hole_no_waypoints_in_exclusion_zone() {
     ];
     let poly = Polygon::with_holes(outer, vec![hole]);
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
     let clipped = clip_to_polygon(plan, &poly);
 
     for line in &clipped.lines {
@@ -380,7 +380,7 @@ fn geopackage_metadata_fields_present() {
     let dir = tempdir().unwrap();
     let gpkg_path = dir.path().join("metadata.gpkg");
 
-    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params()).unwrap();
+    let plan = generate_flight_lines(&england_bbox(), 0.0, &standard_params(), None).unwrap();
 
     let gpkg = GeoPackage::new(&gpkg_path).unwrap();
     gpkg.create_feature_table("flight_lines").unwrap();
@@ -396,7 +396,7 @@ fn geopackage_metadata_fields_present() {
     gpkg.upsert_metadata("copernicus_disclaimer", "test disclaimer")
         .unwrap();
 
-    assert_eq!(gpkg.query_metadata("schema_version").unwrap().unwrap(), "2");
+    assert_eq!(gpkg.query_metadata("schema_version").unwrap().unwrap(), "3");
     assert_eq!(
         gpkg.query_metadata("safety_dsm_warning").unwrap().unwrap(),
         "test warning"

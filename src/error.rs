@@ -219,6 +219,43 @@ pub enum TrajectoryError {
 }
 
 // ---------------------------------------------------------------------------
+// Kinematics errors
+// ---------------------------------------------------------------------------
+
+/// Errors from the kinematics subsystem (wind triangle, turn radius).
+#[derive(Debug, Error)]
+pub enum KinematicsError {
+    /// The crosswind component exceeds TAS on the specified track, making it
+    /// impossible for the aircraft to maintain the desired ground path.
+    #[error(
+        "track {track_deg:.1}\u{00b0} infeasible: crosswind component exceeds \
+         TAS {tas_ms:.1} m/s (wind {wind_ms:.1} m/s)"
+    )]
+    TrackInfeasible {
+        track_deg: f64,
+        wind_ms: f64,
+        tas_ms: f64,
+    },
+
+    /// The headwind along the track exceeds TAS, resulting in zero or negative
+    /// ground speed — the aircraft would fly backwards.
+    #[error(
+        "negative ground speed {gs_ms:.1} m/s on track {track_deg:.1}\u{00b0}: \
+         headwind exceeds TAS"
+    )]
+    NegativeGroundSpeed { track_deg: f64, gs_ms: f64 },
+
+    /// A parameter value was non-finite, out of range, or otherwise invalid.
+    #[error("invalid kinematics parameter: {0}")]
+    InvalidParameter(String),
+
+    /// The wind correction angle is so large that the effective swath width
+    /// is zero — no contiguous sidelap coverage is possible.
+    #[error("infeasible wind: crab angle {wca_deg:.1}\u{00b0} reduces effective swath to zero")]
+    InfeasibleWind { wca_deg: f64 },
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -313,5 +350,32 @@ mod tests {
         };
         let msg = e.to_string();
         assert!(msg.contains("429") && msg.contains("rate limited"));
+    }
+
+    #[test]
+    fn kinematics_error_track_infeasible_display() {
+        let e = KinematicsError::TrackInfeasible {
+            track_deg: 90.0,
+            wind_ms: 40.0,
+            tas_ms: 30.0,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("90.0") && msg.contains("40.0") && msg.contains("30.0"));
+    }
+
+    #[test]
+    fn kinematics_error_negative_gs_display() {
+        let e = KinematicsError::NegativeGroundSpeed {
+            track_deg: 0.0,
+            gs_ms: -5.0,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("-5.0") && msg.contains("0.0"));
+    }
+
+    #[test]
+    fn kinematics_error_invalid_param_display() {
+        let e = KinematicsError::InvalidParameter("negative speed".into());
+        assert!(e.to_string().contains("negative speed"));
     }
 }

@@ -255,6 +255,10 @@ pub fn flight_plan_to_geojson(
             let min_alt = elevs.iter().cloned().fold(f64::INFINITY, f64::min);
             let max_alt = elevs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
+            let crab = line
+                .representative_crab_angle()
+                .map_or(Value::Null, |v| json!(v));
+
             json!({
                 "type": "Feature",
                 "geometry": {
@@ -268,7 +272,8 @@ pub fn flight_plan_to_geojson(
                     "max_altitude_m": max_alt,
                     "target_gsd_m": plan.params.target_gsd_m,
                     "side_lap_pct": plan.params.side_lap_percent,
-                    "end_lap_pct": plan.params.end_lap_percent
+                    "end_lap_pct": plan.params.end_lap_percent,
+                    "crab_angle_deg": crab
                 }
             })
         })

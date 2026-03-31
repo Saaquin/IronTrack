@@ -253,6 +253,15 @@ pub struct FlightLine {
     /// suppress camera triggering for transit lines (procedure turns,
     /// repositioning legs). Default: false (survey leg).
     pub is_transit: bool,
+    /// Per-segment ground speeds in m/s, accounting for wind.
+    /// Length = `len() - 1` (one value per segment between consecutive waypoints).
+    /// `None` when wind is not specified or not yet computed.
+    /// Computed as the LAST step after all line manipulations.
+    ground_speeds_ms: Option<Vec<f64>>,
+    /// Per-segment wind correction (crab) angles in degrees.
+    /// Length = `len() - 1` (one value per segment). Positive = heading right of track.
+    /// `None` when wind is not applied.
+    crab_angles_deg: Option<Vec<f64>>,
 }
 
 impl FlightLine {
@@ -300,6 +309,8 @@ impl FlightLine {
             elevations,
             altitude_datum: datum,
             is_transit,
+            ground_speeds_ms: None,
+            crab_angles_deg: None,
         }
     }
 
@@ -312,6 +323,55 @@ impl FlightLine {
             self.altitude_datum,
             self.is_transit,
         )
+    }
+
+    /// Per-segment ground speeds (m/s). Returns `None` if wind was not applied.
+    /// When `Some`, the vector has length `self.len() - 1`.
+    pub fn ground_speeds(&self) -> Option<&[f64]> {
+        self.ground_speeds_ms.as_deref()
+    }
+
+    /// Set per-segment ground speeds. Panics in debug if length != len() - 1.
+    pub fn set_ground_speeds(&mut self, gs: Vec<f64>) {
+        debug_assert!(
+            self.lats.is_empty() || gs.len() == self.lats.len() - 1,
+            "ground_speeds length must be len()-1"
+        );
+        self.ground_speeds_ms = Some(gs);
+    }
+
+    /// Clear per-segment ground speeds (e.g., when reapplying calm wind).
+    pub fn clear_ground_speeds(&mut self) {
+        self.ground_speeds_ms = None;
+    }
+
+    /// Per-segment crab angles (degrees). Returns `None` if wind was not applied.
+    /// When `Some`, the vector has length `self.len() - 1`.
+    pub fn crab_angles(&self) -> Option<&[f64]> {
+        self.crab_angles_deg.as_deref()
+    }
+
+    /// Set per-segment crab angles. Panics in debug if length != len() - 1.
+    pub fn set_crab_angles(&mut self, angles: Vec<f64>) {
+        debug_assert!(
+            self.lats.is_empty() || angles.len() == self.lats.len() - 1,
+            "crab_angles length must be len()-1"
+        );
+        self.crab_angles_deg = Some(angles);
+    }
+
+    /// Clear per-segment crab angles (e.g., when reapplying calm wind).
+    pub fn clear_crab_angles(&mut self) {
+        self.crab_angles_deg = None;
+    }
+
+    /// Representative crab angle for this flight line: the maximum absolute
+    /// value across all segments. Returns `None` if wind was not applied.
+    /// Used for GeoPackage and GeoJSON export (one value per line row).
+    pub fn representative_crab_angle(&self) -> Option<f64> {
+        self.crab_angles_deg
+            .as_ref()
+            .and_then(|v| v.iter().map(|a| a.abs()).reduce(f64::max))
     }
 
     pub fn lats(&self) -> &[f64] {
@@ -1109,5 +1169,29 @@ mod tests {
             0.0,
             epsilon = 1e-10
         );
+    }
+
+    // --- FlightLine ground_speeds -------------------------------------------
+
+    #[test]
+    fn ground_speeds_default_is_none() {
+        let line = FlightLine::new();
+        assert!(line.ground_speeds().is_none());
+    }
+
+    #[test]
+    fn ground_speeds_roundtrip() {
+        let mut line = FlightLine::new();
+        line.push(0.0, 0.0, 100.0);
+        line.push(0.001, 0.0, 100.0);
+        line.push(0.002, 0.0, 100.0);
+
+        let gs = vec![25.0, 30.0];
+        line.set_ground_speeds(gs.clone());
+
+        let got = line.ground_speeds().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_abs_diff_eq!(got[0], 25.0, epsilon = 1e-10);
+        assert_abs_diff_eq!(got[1], 30.0, epsilon = 1e-10);
     }
 }

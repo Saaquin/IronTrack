@@ -495,7 +495,7 @@ fn kahan_sum_no_drift_large_accumulation() {
         max_lon: 1.80, // ~200 km E–W at the equator
     };
 
-    let plan = generate_flight_lines(&bbox, 90.0, &params).expect("valid flight plan");
+    let plan = generate_flight_lines(&bbox, 90.0, &params, None).expect("valid flight plan");
 
     assert!(
         plan.lines.len() >= 1,
