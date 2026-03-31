@@ -220,6 +220,7 @@ impl PlatformDynamics {
             (k1, k2)
         } else {
             let k1 = 0.5 * RHO_SEA_LEVEL * self.drag_coefficient * self.frontal_area_m2 / eta;
+            // Default 0.12 m² matches Phantom 4 Pro rotor disk area.
             let a_rotor = self.rotor_disk_area_m2.unwrap_or(0.12);
             let k2 = weight * weight / (2.0 * RHO_SEA_LEVEL * a_rotor * eta);
             (k1, k2)

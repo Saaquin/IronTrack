@@ -395,6 +395,8 @@ fn transit_energy_j(ctx: &EnergyCostCtx, lat1: f64, lon1: f64, lat2: f64, lon2: 
         Err(_) => return f64::MAX, // infeasible heading
     };
 
+    // TAS is validated at optimize_route_energy() entry; this is a defensive
+    // fallback for an unreachable path.
     let power = ctx
         .platform
         .power_required_w(ctx.tas_ms)
@@ -424,6 +426,7 @@ fn line_energy_j(ctx: &EnergyCostCtx, ep: &Endpoint, reversed: bool) -> f64 {
         Err(_) => return f64::MAX,
     };
 
+    // TAS is validated at optimize_route_energy() entry; defensive fallback.
     let power = ctx
         .platform
         .power_required_w(ctx.tas_ms)
@@ -650,6 +653,12 @@ pub fn optimize_route_energy(
     v_tas_ms: f64,
     wind: &WindVector,
 ) -> RouteResult {
+    // Validate TAS upfront so downstream power_required_w() calls cannot fail.
+    debug_assert!(
+        v_tas_ms.is_finite() && v_tas_ms > 0.0,
+        "optimize_route_energy requires positive finite TAS, got {v_tas_ms}"
+    );
+
     let valid_indices: Vec<usize> = lines
         .iter()
         .enumerate()
