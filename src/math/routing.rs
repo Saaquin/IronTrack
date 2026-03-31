@@ -167,7 +167,9 @@ impl Endpoint {
 // ---------------------------------------------------------------------------
 
 fn geo_dist(geod: &Geodesic, lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let (s12, _, _): (f64, f64, f64) = InverseGeodesic::inverse(geod, lat1, lon1, lat2, lon2);
+    // InverseGeodesic<f64> returns s12 (distance in metres) directly.
+    // The 3-tuple form returns (azi1, azi2, a12) — NOT (s12, azi1, azi2).
+    let s12: f64 = InverseGeodesic::inverse(geod, lat1, lon1, lat2, lon2);
     s12
 }
 

@@ -274,7 +274,8 @@ pub fn compute_segment_ground_speeds(
             let lat2 = lats_rad[i + 1].to_degrees();
             let lon2 = lons_rad[i + 1].to_degrees();
 
-            let (_, azi1, _): (f64, f64, f64) =
+            // InverseGeodesic<(f64,f64,f64)> returns (azi1, azi2, a12).
+            let (azi1, _, _): (f64, f64, f64) =
                 InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
 
             // azi1 is forward azimuth in degrees [-180, 180]. Normalize to [0, 360).
@@ -338,7 +339,8 @@ pub fn apply_wind_to_plan(
                 let lat2 = lats[i + 1].to_degrees();
                 let lon2 = lons[i + 1].to_degrees();
 
-                let (_, azi1, _): (f64, f64, f64) =
+                // InverseGeodesic<(f64,f64,f64)> returns (azi1, azi2, a12).
+                let (azi1, _, _): (f64, f64, f64) =
                     InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
 
                 let mut track = azi1;

@@ -1277,12 +1277,13 @@ fn compute_mock_heading(
     prev: Option<(f64, f64)>,
 ) -> f64 {
     let geod = geographiclib_rs::Geodesic::wgs84();
+    // InverseGeodesic<(f64,f64,f64)> returns (azi1, azi2, a12).
     let azi = if let Some((lat2, lon2)) = next {
-        let (_dist, azi1, _azi2) =
+        let (azi1, _azi2, _a12) =
             geographiclib_rs::InverseGeodesic::inverse(&geod, lat, lon, lat2, lon2);
         azi1
     } else if let Some((lat1, lon1)) = prev {
-        let (_dist, azi1, _azi2) =
+        let (azi1, _azi2, _a12) =
             geographiclib_rs::InverseGeodesic::inverse(&geod, lat1, lon1, lat, lon);
         azi1
     } else {
@@ -1430,7 +1431,8 @@ fn calculate_total_distance(plan: &FlightPlan) -> f64 {
                 line.lons()[i - 1].to_degrees(),
             );
             let (lat2, lon2) = (line.lats()[i].to_degrees(), line.lons()[i].to_degrees());
-            let (dist, _, _) =
+            // InverseGeodesic<f64> returns s12 (distance in metres) directly.
+            let dist: f64 =
                 geographiclib_rs::InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
             acc.add(dist);
         }

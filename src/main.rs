@@ -1428,7 +1428,8 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
         let (lat1, lon1) = centerline[0];
         let (lat2, lon2) = centerline[1];
         let geod = geographiclib_rs::Geodesic::wgs84();
-        let (_, azi1, _) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
+        // InverseGeodesic<(f64,f64,f64)> returns (azi1, azi2, a12).
+        let (azi1, _, _) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
         ((azi1 % 360.0) + 360.0) % 360.0
     } else {
         0.0

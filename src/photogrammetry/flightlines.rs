@@ -737,7 +737,8 @@ pub fn connect_with_turns(plan: FlightPlan, turn_params: &TurnParams) -> FlightP
         let lon1 = line.lons()[i1].to_degrees();
         let lat2 = line.lats()[i2].to_degrees();
         let lon2 = line.lons()[i2].to_degrees();
-        let (_, azi1, _): (f64, f64, f64) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
+        // InverseGeodesic<(f64,f64,f64)> returns (azi1, azi2, a12).
+        let (azi1, _, _): (f64, f64, f64) = InverseGeodesic::inverse(&geod, lat1, lon1, lat2, lon2);
         // Convert geodesic azimuth (CW from north) to math angle (CCW from east).
         azimuth_to_math(azi1)
     };
