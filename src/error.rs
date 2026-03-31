@@ -253,6 +253,19 @@ pub enum KinematicsError {
     /// is zero — no contiguous sidelap coverage is possible.
     #[error("infeasible wind: crab angle {wca_deg:.1}\u{00b0} reduces effective swath to zero")]
     InfeasibleWind { wca_deg: f64 },
+
+    /// The computed mission energy exceeds 80% of battery capacity (20% reserve
+    /// policy, Doc 38). The mission is not feasible without reducing scope or
+    /// increasing battery capacity.
+    #[error(
+        "mission energy {energy_j:.0} J exceeds 80% reserve threshold \
+         ({threshold_j:.0} J) of {battery_wh:.0} Wh battery"
+    )]
+    EnergyExceedsReserve {
+        energy_j: f64,
+        threshold_j: f64,
+        battery_wh: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------

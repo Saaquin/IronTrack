@@ -16,7 +16,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! Kinematics subsystem: wind triangle solver, wind-corrected turn radius,
-//! and atmospheric computations for aerial survey flight planning.
+//! atmospheric computations, and aerodynamic energy modeling for aerial survey
+//! flight planning.
 //!
 //! All functions are pure synchronous math — no async, no I/O.
 //! Uses f64 exclusively for all physical quantities.
@@ -24,8 +25,11 @@
 //! Reference documents:
 //!   - Doc 03: Wind Correction Angle (WCA) / crab angle formulation
 //!   - Doc 16: Aerial wind data, meteorological conventions
+//!   - Doc 38: UAV Endurance Modeling — power models, per-segment energy
 //!   - Doc 50: Wind-corrected turn radius (r_safe)
 
 pub mod atmosphere;
+pub mod energy;
 
 pub use atmosphere::{WindResult, WindVector};
+pub use energy::{EnergyEstimate, PlatformDynamics};

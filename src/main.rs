@@ -225,6 +225,32 @@ enum Commands {
         #[arg(long, value_name = "DEG", requires = "wind_speed")]
         wind_dir: Option<f64>,
 
+        // --- Energy estimation (optional) --------------------------------------
+        /// Platform takeoff mass in kg (all-up weight including battery and
+        /// payload). Enables aerodynamic energy estimation when specified.
+        #[arg(long, value_name = "KG")]
+        platform_mass: Option<f64>,
+
+        /// Parasite drag coefficient (dimensionless, typically 0.5–1.5).
+        #[arg(long, value_name = "CD", default_value = "1.0")]
+        platform_drag_coeff: f64,
+
+        /// Frontal area perpendicular to flight direction in m² (multirotor).
+        #[arg(long, value_name = "M2", default_value = "0.04")]
+        platform_frontal_area: f64,
+
+        /// Total rotor disk area in m² (multirotor, sum of all rotors).
+        #[arg(long, value_name = "M2", default_value = "0.12")]
+        platform_rotor_area: f64,
+
+        /// Battery capacity in Wh. Default: 89.2 (Phantom 4 Pro).
+        #[arg(long, value_name = "WH", default_value = "89.2")]
+        battery_capacity_wh: f64,
+
+        /// Propulsive efficiency (0.0–1.0, motor + ESC + propeller).
+        #[arg(long, value_name = "ETA", default_value = "0.65")]
+        propulsive_efficiency: f64,
+
         // --- Route optimization ---------------------------------------------
         /// Enable TSP route optimization to minimize repositioning distance.
         /// Reorders flight lines using nearest-neighbor + 2-opt heuristic.
@@ -380,6 +406,12 @@ fn main() {
             turn_airspeed,
             wind_speed,
             wind_dir,
+            platform_mass,
+            platform_drag_coeff,
+            platform_frontal_area,
+            platform_rotor_area,
+            battery_capacity_wh,
+            propulsive_efficiency,
             optimize_route,
             launch_lat,
             launch_lon,
@@ -419,6 +451,12 @@ fn main() {
             turn_airspeed,
             wind_speed,
             wind_dir,
+            platform_mass,
+            platform_drag_coeff,
+            platform_frontal_area,
+            platform_rotor_area,
+            battery_capacity_wh,
+            propulsive_efficiency,
             optimize_route,
             launch_lat,
             launch_lon,
@@ -576,6 +614,12 @@ struct PlanArgs {
     turn_airspeed: f64,
     wind_speed: Option<f64>,
     wind_dir: Option<f64>,
+    platform_mass: Option<f64>,
+    platform_drag_coeff: f64,
+    platform_frontal_area: f64,
+    platform_rotor_area: f64,
+    battery_capacity_wh: f64,
+    propulsive_efficiency: f64,
     optimize_route: bool,
     launch_lat: Option<f64>,
     launch_lon: Option<f64>,
@@ -909,6 +953,74 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         if !survey_gs.is_empty() {
             let avg: f64 = survey_gs.iter().sum::<f64>() / survey_gs.len() as f64;
             println!("Average ground speed (survey legs): {avg:.1} m/s");
+        }
+    }
+
+    // --- Energy estimation (optional) ----------------------------------------
+
+    if let Some(mass) = args.platform_mass {
+        let platform = irontrack::kinematics::PlatformDynamics::new(
+            mass,
+            args.platform_drag_coeff,
+            args.platform_frontal_area,
+            None,
+            None,
+            None,
+            Some(args.platform_rotor_area),
+            None,
+            args.battery_capacity_wh,
+            1.05, // Peukert k for LiPo [Doc 38]
+            args.propulsive_efficiency,
+            0.0, // regen efficiency (conservative: no regen)
+        )
+        .context("invalid platform parameters")?;
+
+        let estimate = irontrack::kinematics::energy::estimate_mission_energy(
+            &plan,
+            &platform,
+            args.turn_airspeed,
+            args.max_bank_angle,
+        )
+        .context("energy estimation failed")?;
+
+        println!();
+        println!("--- Energy Estimate ---");
+        println!(
+            "  Survey legs  : {:.1} Wh",
+            estimate.survey_energy_j / 3600.0
+        );
+        println!("  Turns/transit: {:.1} Wh", estimate.turn_energy_j / 3600.0);
+        println!(
+            "  Climb/descent: {:.1} Wh",
+            estimate.climb_energy_j / 3600.0
+        );
+        println!(
+            "  Total        : {:.1} Wh",
+            estimate.total_energy_j / 3600.0
+        );
+        println!("  Usable (80%) : {:.1} Wh", args.battery_capacity_wh * 0.80);
+        println!(
+            "  Feasible     : {}",
+            if estimate.feasible { "YES" } else { "NO" }
+        );
+        println!(
+            "  Endurance    : {:.1} min",
+            estimate.estimated_endurance_min
+        );
+        println!(
+            "  Mission time : {:.1} min",
+            estimate.estimated_mission_time_min
+        );
+
+        if !estimate.feasible {
+            bail!(
+                "BLOCKED: mission energy ({:.1} Wh) exceeds 80% battery reserve \
+                 ({:.1} Wh usable). Reduce survey area, increase battery capacity, \
+                 or omit --platform-mass to skip energy check. \
+                 [Doc 38: 20% reserve is mandatory — LiPo voltage cliff risk]",
+                estimate.total_energy_j / 3600.0,
+                args.battery_capacity_wh * 0.80
+            );
         }
     }
 
@@ -1443,6 +1555,74 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
         }
     }
 
+    // --- Energy estimation (optional) ----------------------------------------
+
+    if let Some(mass) = args.platform_mass {
+        let platform = irontrack::kinematics::PlatformDynamics::new(
+            mass,
+            args.platform_drag_coeff,
+            args.platform_frontal_area,
+            None,
+            None,
+            None,
+            Some(args.platform_rotor_area),
+            None,
+            args.battery_capacity_wh,
+            1.05, // Peukert k for LiPo [Doc 38]
+            args.propulsive_efficiency,
+            0.0, // regen efficiency (conservative: no regen)
+        )
+        .context("invalid platform parameters")?;
+
+        let estimate = irontrack::kinematics::energy::estimate_mission_energy(
+            &plan,
+            &platform,
+            args.turn_airspeed,
+            args.max_bank_angle,
+        )
+        .context("energy estimation failed")?;
+
+        println!();
+        println!("--- Energy Estimate ---");
+        println!(
+            "  Survey legs  : {:.1} Wh",
+            estimate.survey_energy_j / 3600.0
+        );
+        println!("  Turns/transit: {:.1} Wh", estimate.turn_energy_j / 3600.0);
+        println!(
+            "  Climb/descent: {:.1} Wh",
+            estimate.climb_energy_j / 3600.0
+        );
+        println!(
+            "  Total        : {:.1} Wh",
+            estimate.total_energy_j / 3600.0
+        );
+        println!("  Usable (80%) : {:.1} Wh", args.battery_capacity_wh * 0.80);
+        println!(
+            "  Feasible     : {}",
+            if estimate.feasible { "YES" } else { "NO" }
+        );
+        println!(
+            "  Endurance    : {:.1} min",
+            estimate.estimated_endurance_min
+        );
+        println!(
+            "  Mission time : {:.1} min",
+            estimate.estimated_mission_time_min
+        );
+
+        if !estimate.feasible {
+            bail!(
+                "BLOCKED: mission energy ({:.1} Wh) exceeds 80% battery reserve \
+                 ({:.1} Wh usable). Reduce survey area, increase battery capacity, \
+                 or omit --platform-mass to skip energy check. \
+                 [Doc 38: 20% reserve is mandatory — LiPo voltage cliff risk]",
+                estimate.total_energy_j / 3600.0,
+                args.battery_capacity_wh * 0.80
+            );
+        }
+    }
+
     // --- DSM safety warning ------------------------------------------------
 
     let agl_datum_conversion_uses_dem = plan.lines.iter().any(|l| l.altitude_datum != target_datum)
@@ -1934,6 +2114,12 @@ fn nl_params_to_plan_args(p: NlPlanParams, output: PathBuf) -> Result<PlanArgs> 
         turn_airspeed: 30.0,
         wind_speed: None,
         wind_dir: None,
+        platform_mass: None,
+        platform_drag_coeff: 1.0,
+        platform_frontal_area: 0.04,
+        platform_rotor_area: 0.12,
+        battery_capacity_wh: 89.2,
+        propulsive_efficiency: 0.65,
         optimize_route: false,
         launch_lat: None,
         launch_lon: None,
