@@ -32,7 +32,7 @@ use irontrack::io::{
 };
 use irontrack::legal;
 use irontrack::math::dubins::TurnParams;
-use irontrack::math::routing::optimize_route;
+use irontrack::math::routing::{optimize_route, optimize_route_energy};
 use irontrack::photogrammetry::corridor::{generate_corridor_lines, CorridorParams};
 use irontrack::photogrammetry::flightlines::{
     adjust_for_terrain, clip_to_polygon, connect_with_turns, generate_flight_lines,
@@ -865,12 +865,54 @@ fn run_plan(args: PlanArgs) -> Result<()> {
     let plan = if args.optimize_route && plan.lines.len() >= 2 {
         let launch_lat = args.launch_lat.unwrap_or(bbox.min_lat);
         let launch_lon = args.launch_lon.unwrap_or(bbox.min_lon);
-        let result = optimize_route(&plan.lines, launch_lat, launch_lon);
-        println!(
-            "Route optimized: {:.0} m repositioning ({} lines reordered)",
-            result.total_reposition_m,
-            result.order.len()
-        );
+
+        // Energy-weighted optimization when platform + wind are both available.
+        let result = if let (Some(mass), Some(ws), Some(wd)) =
+            (args.platform_mass, args.wind_speed, args.wind_dir)
+        {
+            let platform = irontrack::kinematics::PlatformDynamics::new(
+                mass,
+                args.platform_drag_coeff,
+                args.platform_frontal_area,
+                None,
+                None,
+                None,
+                Some(args.platform_rotor_area),
+                None,
+                args.battery_capacity_wh,
+                1.05,
+                args.propulsive_efficiency,
+                0.0,
+            )
+            .context("invalid platform parameters")?;
+            let wind = irontrack::kinematics::WindVector::new(ws, wd)
+                .context("invalid wind parameters")?;
+            optimize_route_energy(
+                &plan.lines,
+                launch_lat,
+                launch_lon,
+                &platform,
+                args.turn_airspeed,
+                &wind,
+            )
+        } else {
+            optimize_route(&plan.lines, launch_lat, launch_lon)
+        };
+
+        if let Some(energy_j) = result.total_energy_j {
+            println!(
+                "Route optimized (energy): {:.1} Wh tour, {:.0} m repositioning ({} lines)",
+                energy_j / 3600.0,
+                result.total_reposition_m,
+                result.order.len()
+            );
+        } else {
+            println!(
+                "Route optimized: {:.0} m repositioning ({} lines reordered)",
+                result.total_reposition_m,
+                result.order.len()
+            );
+        }
 
         let mut reordered = Vec::with_capacity(plan.lines.len());
         for (idx, &line_idx) in result.order.iter().enumerate() {
@@ -1459,12 +1501,53 @@ fn run_corridor_plan(args: &PlanArgs, target_datum: AltitudeDatum) -> Result<()>
         let launch_lon = args
             .launch_lon
             .unwrap_or_else(|| corridor_params.centerline[0].1);
-        let result = optimize_route(&plan.lines, launch_lat, launch_lon);
-        println!(
-            "Route optimized: {:.0} m repositioning ({} lines reordered)",
-            result.total_reposition_m,
-            result.order.len()
-        );
+        // Energy-weighted optimization when platform + wind are both available.
+        let result = if let (Some(mass), Some(ws), Some(wd)) =
+            (args.platform_mass, args.wind_speed, args.wind_dir)
+        {
+            let platform = irontrack::kinematics::PlatformDynamics::new(
+                mass,
+                args.platform_drag_coeff,
+                args.platform_frontal_area,
+                None,
+                None,
+                None,
+                Some(args.platform_rotor_area),
+                None,
+                args.battery_capacity_wh,
+                1.05,
+                args.propulsive_efficiency,
+                0.0,
+            )
+            .context("invalid platform parameters")?;
+            let wind = irontrack::kinematics::WindVector::new(ws, wd)
+                .context("invalid wind parameters")?;
+            optimize_route_energy(
+                &plan.lines,
+                launch_lat,
+                launch_lon,
+                &platform,
+                args.turn_airspeed,
+                &wind,
+            )
+        } else {
+            optimize_route(&plan.lines, launch_lat, launch_lon)
+        };
+
+        if let Some(energy_j) = result.total_energy_j {
+            println!(
+                "Route optimized (energy): {:.1} Wh tour, {:.0} m repositioning ({} lines)",
+                energy_j / 3600.0,
+                result.total_reposition_m,
+                result.order.len()
+            );
+        } else {
+            println!(
+                "Route optimized: {:.0} m repositioning ({} lines reordered)",
+                result.total_reposition_m,
+                result.order.len()
+            );
+        }
 
         let mut reordered = Vec::with_capacity(plan.lines.len());
         for (idx, &line_idx) in result.order.iter().enumerate() {
